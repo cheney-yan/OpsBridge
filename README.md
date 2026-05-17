@@ -177,30 +177,6 @@ file, sshd snippet, and the `opsbridge` symlink. Logs at
 `/var/log/opsbridge/agent/` are kept — remove them separately if
 desired.
 
-## Contributing — secret-scanning hook
-
-The repo ships a `.gitleaks.toml` with project-specific patterns
-(historical leak fingerprints + the gitleaks default ruleset). To run
-the scan before every commit on your machine:
-
-```bash
-brew install gitleaks
-mkdir -p ~/.git-hooks
-cat > ~/.git-hooks/pre-commit <<'SH'
-#!/usr/bin/env bash
-[[ "${SKIP_GITLEAKS:-0}" == "1" ]] && exit 0
-ROOT=$(git rev-parse --show-toplevel) || exit 0
-CFG=()
-[[ -f "$ROOT/.gitleaks.toml" ]] && CFG=(--config "$ROOT/.gitleaks.toml")
-exec gitleaks protect --staged --verbose --redact "${CFG[@]}"
-SH
-chmod +x ~/.git-hooks/pre-commit
-git config --global core.hooksPath ~/.git-hooks
-```
-
-This blocks `git commit` if staged changes match a known secret
-pattern. Use `SKIP_GITLEAKS=1 git commit ...` for the rare false
-positive; better: add a path-level allowlist to `.gitleaks.toml`.
 
 ## License
 
