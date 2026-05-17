@@ -24,59 +24,55 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 # Step 0: get the script onto disk + re-exec as root with a real TTY.
 # -----------------------------------------------------------------------------
+#
+# Why this is one big atomic block: when we're piped (`curl | bash`), bash
+# reads its script from stdin. The `cat > tmpfile` below slurps the REMAINDER
+# of stdin into a file. After cat exits, stdin is EOF and bash has nothing
+# more to read — it would just quietly exit without ever running anything
+# else in this file. So the slurp + sudo re-exec MUST be the last thing in
+# the if-piped branch.
+#
+# `exec sudo -E bash <tmpfile> </dev/tty` is the magic: sudo is invoked from
+# our current shell (not from a pipe), so its stdin is the operator's real
+# TTY, and sudo's child pty (under `Defaults use_pty`) wires up correctly to
+# the terminal. Subsequent prompts in bash and Python both work.
 
-PIPED=0
-[[ -z "${BASH_SOURCE[0]:-}" ]] && PIPED=1
-
-# If we were piped (curl|bash), slurp the rest of stdin into a tmpfile so the
-# script is reachable as a regular file. Bash can then re-exec from the file
-# without further pipe shenanigans.
-SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
-if [[ "$PIPED" -eq 1 ]]; then
-    SCRIPT_PATH=$(mktemp /tmp/opsbridge-install.XXXXXX.sh)
-    cat > "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-fi
-
-# Re-exec under sudo if we're not root yet. We attach /dev/tty as the new
-# stdin so sudo's child pty (if use_pty is on) gets wired to the operator's
-# real terminal. Without this, any read/getpass below would hang on a doomed
-# pty. /dev/null is the CI fallback when no TTY is available.
-if [[ "$(id -u)" -ne 0 ]]; then
-    if (: </dev/tty) 2>/dev/null; then
-        exec sudo -E bash "$SCRIPT_PATH" "$@" </dev/tty
+if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
+    # We were piped. Slurp the rest of stdin and re-exec in one shot.
+    _tmp=$(mktemp /tmp/opsbridge-install.XXXXXX.sh)
+    cat > "$_tmp"
+    chmod +x "$_tmp"
+    if [[ "$(id -u)" -eq 0 ]]; then
+        # Already root (legacy `curl | sudo bash`). The current pty is
+        # detached from any usable input source (the curl pipe is gone),
+        # so interactive prompts will see EOF. Env-var mode still works.
+        if (: </dev/tty) 2>/dev/null; then
+            exec bash "$_tmp" "$@" </dev/tty
+        else
+            exec bash "$_tmp" "$@" </dev/null
+        fi
     else
-        exec sudo -E bash "$SCRIPT_PATH" "$@" </dev/null
+        # Not root: re-elevate. sudo invoked from THIS shell (not a pipe),
+        # with our TTY as stdin, so sudo's child pty is properly connected.
+        if (: </dev/tty) 2>/dev/null; then
+            exec sudo -E bash "$_tmp" "$@" </dev/tty
+        else
+            exec sudo -E bash "$_tmp" "$@" </dev/null
+        fi
     fi
 fi
 
-# If we were piped AND already root (the legacy `curl | sudo bash` pattern),
-# the pty is doomed — prompts won't work. Refuse early with guidance unless
-# env-var mode covers everything.
-if [[ "$PIPED" -eq 1 && -z "${OPSBRIDGE_API_KEY:-}" ]]; then
-    cat >&2 <<'EOF'
-
-[install] Detected `curl | sudo bash` without OPSBRIDGE_API_KEY env var.
-[install] This pattern can't be interactive — sudo's child pty is detached
-[install] from your terminal. Use one of:
-[install]
-[install]   # Interactive (recommended — sudo handled internally):
-[install]   curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/main/install.sh | bash
-[install]
-[install]   # Or env-var driven:
-[install]   curl -fsSL .../install.sh | sudo \
-[install]     OPSBRIDGE_PROVIDER=anthropic \
-[install]     OPSBRIDGE_MODEL=claude-sonnet-4-6 \
-[install]     OPSBRIDGE_BASE_URL=https://your.proxy/v1 \
-[install]     OPSBRIDGE_API_KEY=your-key \
-[install]     OPSBRIDGE_PUBKEY="ssh-ed25519 AAAA... me@laptop" \
-[install]     bash
-[install]
-EOF
-    exit 1
+# We're running from a real file (not a pipe). If we're not root yet
+# (i.e., the user invoked `bash install.sh` directly), sudo-elevate now.
+if [[ "$(id -u)" -ne 0 ]]; then
+    if (: </dev/tty) 2>/dev/null; then
+        exec sudo -E bash "$0" "$@" </dev/tty
+    else
+        exec sudo -E bash "$0" "$@" </dev/null
+    fi
 fi
 
-# Past this point: root, on disk as $SCRIPT_PATH, stdin attached to TTY
+# Past this point: root, running from a real file, fd 0 attached to TTY
 # (or /dev/null in env-var mode).
 
 REPO_URL="${OPSBRIDGE_REPO_URL:-https://github.com/cheney-yan/OpsBridge.git}"
