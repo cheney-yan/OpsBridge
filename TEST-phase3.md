@@ -386,6 +386,230 @@ Textual `Pilot` test (`tests/test_input_wide_chars.py`):
 
 ---
 
+## §11 — `/model` slash command (switch model mid-session)
+
+### Acceptance
+
+**T3-11-A1 — `/model <id>` swaps directly**
+
+Unit test (`tests/test_tui_slash_model.py`):
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_slash_model_with_arg_swaps_model` | App with mock agent + model="A"; type `/model B` Enter | `agent.model` becomes "B" without any picker UI; top log echoes `[model] A → B` |
+| `test_slash_model_handles_unknown_id` | Same; type `/model nonexistent` | Swap still happens (proxies serve unlisted models); next LLM call surfaces the real error |
+| `test_slash_model_records_audit_event` | Plug a SessionLogger; type `/model B` | `model_switch` event in JSONL with `from=A`, `to=B`, `source=/model` |
+
+**T3-11-A2 — bare `/model` opens picker**
+
+Textual `Pilot` test:
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_slash_model_opens_picker` | Mock /v1/models returning 15 ids; type `/model` Enter | Middle region shows numbered list; status bar shows `awaiting input · model picker`; first 8–12 models visible |
+| `test_picker_arrow_keys_highlight` | Picker open; press Down 3× | Highlight moves to 4th entry; previous entries unhighlighted |
+| `test_picker_enter_applies` | Picker open with #3 highlighted | Press Enter; `agent.model` swaps to entry #3; picker dismissed; top log echoes |
+| `test_picker_esc_cancels` | Picker open | Press Esc; picker dismissed; `agent.model` unchanged |
+| `test_picker_number_keys_pick_directly` | Picker open with 15 entries | Press `5`; entry #5 applied immediately (no Enter needed for digit-pick) |
+
+**T3-11-A3 — pagination for long lists**
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_picker_paginates_when_more_than_page_size` | Mock /v1/models returning 30 ids; small terminal (80×24) | Picker shows page-size models + a `... 12 more (n=next, p=prev)` footer |
+| `test_picker_n_advances_page` | Picker open page 1; press `n` | Page 2 visible; highlight jumps to top of page 2 |
+| `test_picker_p_returns_page` | Picker on page 2; press `p` | Back to page 1; highlight at first entry |
+| `test_picker_n_at_last_page_wraps_or_clamps` | Picker on last page; press `n` | Stays on last page (clamps, not wraps — too easy to lose your spot otherwise) |
+
+**T3-11-A4 — incremental filter**
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_picker_slash_starts_filter` | Picker open; type `/` | Footer shows `filter:` cursor; further keystrokes narrow the visible list (substring match) |
+| `test_picker_filter_no_matches_shows_message` | Type filter `zzzzz` | List replaced by `no matches — Esc to clear filter` |
+| `test_picker_esc_in_filter_clears_filter_not_picker` | With active filter; press Esc | Filter cleared, full list back; picker still open. Second Esc closes picker. |
+
+**T3-11-A5 — mid-flight model swap is queued**
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_slash_model_during_thinking_queues` | Trigger a slow fake agent turn; while it runs, type `/model B` | Top log: `[model] swap queued — will apply after current turn`; current turn completes with model A; next turn uses B |
+| `test_slash_model_during_ask_form_rejected` | While `ask` form is open, type `/model B` | Top log: `[model] dismiss the form first`; agent.model unchanged; form remains active |
+| `test_queued_swap_audit_event_at_apply_time` | Mid-flight queue scenario | `model_switch` event timestamp is when the swap actually happened (post-turn), not when /model was typed |
+
+**T3-11-A6 — `/model save <id>` persists to config.toml**
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_slash_model_save_writes_config` | Wired-in fake config.toml at tmp path; type `/model save B` | After swap, `config.toml` re-read shows `model = "B"`; audit event source=`/model save` |
+| `test_slash_model_save_preserves_other_fields` | config.toml has provider/base_url/[visit] | After `/model save`, those fields untouched; only `model` line replaced |
+| `test_slash_model_without_save_does_not_touch_config` | `/model B` (no save) | config.toml unchanged on disk |
+
+**T3-11-A7 — E2E**
+
+Real LLM, real proxy:
+
+1. SSH into agent. Confirm the TUI header shows `claude-sonnet-4-6`.
+2. Type any short request. Agent answers with sonnet (verify via audit).
+3. Type `/model`. Picker opens; pick `claude-haiku-4-5`.
+4. Header status updates to show `claude-haiku-4-5`.
+5. Type the same request. Audit shows turn used haiku.
+6. Type `/model save claude-sonnet-4-6`. Confirmation.
+7. Ctrl-D. Re-ssh. Session starts on sonnet (the saved choice).
+
+Pass: all six steps observable; audit log records model_switch events
+at steps 3, 6.
+
+### Negative / edge
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_slash_model_no_models_endpoint_falls_back` | Mock /v1/models returning 502 | Picker shows `couldn't discover models — type a model id` and accepts free-text |
+| `test_slash_model_empty_endpoint_response` | Mock returns `{"data":[]}` | Same fallback message |
+| `test_slash_model_at_session_start_before_first_turn` | Brand new session; immediately type `/model B` | Swap applies; first user turn uses model B |
+| `test_picker_filter_with_special_chars` | Type filter with `/` `.` `-` | Treated as literal substring; no regex injection |
+
+### Regression guards
+
+| File | Test |
+|---|---|
+| `test_tui.py::test_slash_quit_command_exits` | `/quit` still works (slash dispatch unchanged) |
+| `test_tui.py::test_app_constructs` | Header model display reads from agent.model, picks up changes |
+| `test_logging.py::*` | New `model_switch` event doesn't break existing readers |
+
+---
+
+## §12 — `!` prefix for direct bash execution
+
+### Acceptance
+
+**T3-12-A1 — Sigil routes to bash, skipping the LLM**
+
+Unit test (`tests/test_tui_bang.py`):
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_bang_routes_to_bash_directly` | App with mock agent + fake bash tool; type `!echo hi` Enter | bash tool fires with `command="echo hi"`; agent.run() NEVER called; output streams to top region |
+| `test_bang_with_leading_space_tolerated` | Type `! echo hi` | Same — leading space after `!` ignored |
+| `test_bang_in_middle_of_line_not_special` | Type `please !ls` | Routed to LLM as a normal turn; `!` treated as literal |
+| `test_escaped_bang_treated_as_text` | Type `\!ls` | Routed to LLM; LLM sees `!ls` (escape stripped) |
+| `test_bang_audit_event_has_source_direct` | Type `!whoami` + audit log inspect | `tool_call(tool=bash)` event has `source="direct"` (vs `"llm"`) |
+
+**T3-12-A2 — Skips ask confirmation chokepoint by design**
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_bang_skips_ask_form` | Type `!rm /tmp/whatever` | bash runs immediately; NO `ask_pre_exec` event in audit log |
+| `test_bang_still_emits_bash_pre_exec` | Type any `!cmd` | `bash_pre_exec` event still fires (so audit chain isn't broken — direct exec is logged, just not gated) |
+
+**T3-12-A3 — Pairs with §13 cwd**
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_bang_sticky_cwd` | Type `!cd /tmp` then `!pwd` | Second command outputs `/tmp` (cwd persisted between `!` calls); status bar shows `/tmp` |
+
+**T3-12-A4 — E2E**
+
+In a VM:
+1. SSH into agent.
+2. Type `!ls /etc/opsbridge/agent`. Observe immediate output — no `[thinking]` step.
+3. Audit log shows `tool_call(tool=bash, source="direct")` with no `ask_pre_exec` before it.
+4. Type a normal English request. Routes through LLM as before.
+
+Pass: direct-exec is sub-second, no LLM round-trip; normal flow unaffected.
+
+### Negative / edge
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_bang_alone_is_ignored` | Type just `!` Enter | Treated as empty; no exec, no LLM call, no error |
+| `test_bang_empty_after_strip` | Type `!   ` (whitespace only) | Same — no exec |
+| `test_bang_handles_multi_command_chain` | Type `!cd /tmp && touch x && ls` | Whole chain runs; output captured |
+
+### Regression guards
+
+| File | Test |
+|---|---|
+| `test_tui.py::test_app_constructs` | Bare TUI launch still works |
+| `test_bash_pre_exec.py::*` | `bash_pre_exec` still precedes `tool_call` for all bash paths |
+| `test_ask.py::*` | ask tool unchanged for the LLM-routed path |
+
+---
+
+## §13 — Current-folder indicator in status bar
+
+### Acceptance
+
+**T3-13-A1 — cwd appears in status bar**
+
+Unit / snapshot test:
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_status_bar_shows_default_cwd` | Boot fresh App | Status bar contains `/home/agent` (or whatever DEFAULT_BASH_CWD points to) |
+| `test_status_bar_compresses_home_to_tilde` | Start with cwd=`/home/agent` | Displays `~`, not the full path |
+| `test_status_bar_truncates_long_paths` | Set cwd to `/usr/share/very/deep/nested/path/here` | Displays `/usr/share/…/path/here` (ellipsis in the middle, total ≤ ~30 chars) |
+| `test_status_bar_updates_after_bash_cd` | Run `cd /tmp` via bash tool | Status bar reflects `/tmp` after the call completes |
+
+**T3-13-A2 — Sticky between `bash` invocations**
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_sticky_cwd_persists_across_calls` | `bash cd /tmp` then `bash pwd` | Second call's pwd output is `/tmp` (not /home/agent default) |
+| `test_sticky_cwd_isolates_per_session` | Session A `cd /tmp`; new session B | Session B's cwd starts at default, not /tmp |
+| `test_sticky_cwd_reset_on_session_end` | End session; reconnect | Fresh cwd at default |
+
+**T3-13-A3 — fd-3 capture doesn't pollute output**
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_pwd_capture_invisible` | `bash echo foo` | Output is exactly `foo\n`; no trailing path leakage |
+| `test_pwd_capture_handles_failed_cd` | `bash cd /nonexistent` | cwd_track stays at previous value; exit non-zero captured normally |
+
+### Regression guards
+
+| File | Test |
+|---|---|
+| `test_tools.py::TestBash::*` | All existing bash tests pass (no output corruption from cwd-track) |
+| `test_logging.py::*` | bash audit events unchanged |
+| `test_tui.py::test_app_constructs` | Status bar still renders |
+
+---
+
+## §14 — `/help` slash command
+
+### Acceptance
+
+**T3-14-A1 — `/help` prints reference**
+
+Unit test (`tests/test_tui_help.py`):
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_slash_help_prints_to_top_region` | Type `/help` Enter | Top region gains a multi-line block containing `slash commands` keyword + listing of `/model /quit /help` etc. |
+| `test_slash_question_mark_alias` | Type `/?` Enter | Same content rendered |
+| `test_help_mentions_bang_prefix` | Type `/help` | Output contains `!<cmd>` direct-exec instructions |
+| `test_help_mentions_ctrl_d_arming` | Type `/help` | Output mentions `Ctrl-D ×2` |
+| `test_help_no_llm_call` | Type `/help`; assert agent.run() not called | Reference rendered without any LLM turn |
+
+**T3-14-A2 — help text stays in sync with implemented commands**
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_help_lists_all_registered_slash_commands` | Reflect over the slash-command registry; compare against `/help` text content | Every registered command appears in the help output; no listed-but-missing commands |
+
+This is a meta-test that catches drift when someone adds a new slash
+command without updating the help string.
+
+### Regression guards
+
+| File | Test |
+|---|---|
+| `test_tui.py::test_slash_quit_command_exits` | `/quit` still works |
+| `test_tui.py::*` | Bare TUI still launches |
+
+---
+
 ## Cross-issue: Phase 2 tests that must still pass
 
 After all of Phase 3 lands, the existing 121-test suite (Phase 1

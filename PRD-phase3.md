@@ -392,6 +392,263 @@ because OpsBridge has a Chinese-speaking operator base.
 Priority: **high** for operators who type Chinese; low for English-only
 users. Bumps to high overall given the project's audience.
 
+## 11. `/model` slash command — switch model mid-session
+
+### Symptom
+
+The operator picks a model at install time. During a session they realize
+the chosen model is wrong for the task — too slow (sonnet on a quick
+question), too cheap (haiku for a tricky bash debug), unavailable
+(proxy rate-limited that model), or just curious to compare. Today the
+only way out is:
+
+- Ctrl-D → `sudo opsbridge config` → re-prompt for everything → re-ssh.
+
+That's a six-step ceremony for what should be a one-line operator action.
+
+### Acceptance shape
+
+A `/model` slash command in the TUI input line:
+
+- **`/model`** with no argument — opens a picker in the middle region.
+  Re-uses install.sh's model-discovery: fetches `<base_url>/v1/models`,
+  paginates if more than ~12 fit on screen, highlights the currently-active
+  one, defaults to a sensible recommendation (first `claude-sonnet*` for
+  anthropic, etc., same logic as install.sh `default_model_from_list`).
+  Operator picks via number (`1`..`9`), arrow keys, or by typing a model
+  id. Enter applies; Esc / Ctrl-C cancels with the active model intact.
+- **`/model <id>`** with explicit id — swaps directly without the picker.
+  Useful muscle-memory shortcut for operators who already know what they
+  want (`/model claude-haiku-4-5`). If the id isn't in the discovered
+  list, we still try it — proxies sometimes serve un-listed models.
+- Either way, the swap is **session-only** by default. `/etc/opsbridge/
+  agent/config.toml` is unchanged — next session re-loads the installed
+  default. A separate `/model save <id>` (or `/model --persist`)
+  variant writes back to config.toml. (Keep the dangerous one explicit;
+  no surprise persistence.)
+
+### Pagination
+
+Most operators see 20–40 models on a real proxy (claude family + gpt
+family + grok + gemini = ~25 today on our test proxy). Shoving all
+into the middle region wastes screen space and forces scrolling on
+small terminals (80×24 is the lower bound we support).
+
+Page size = visible-rows-in-middle-region-minus-3 (header, footer, prompt).
+Floor: 8. Navigation: `n` / `p` / arrow-down / arrow-up to page;
+`/` to filter (typing narrows the list as you type, like fzf); Enter
+to pick the highlighted entry.
+
+State stays in the middle region — the model picker IS a form, same
+widget class as the `ask` form. Top region keeps scrolling; status bar
+shows `awaiting input · model picker` while open.
+
+### Mid-flight semantics
+
+What happens to an in-flight agent turn?
+
+| State | `/model X` behavior |
+|---|---|
+| Idle (operator's turn) | Pick immediately; next operator turn uses new model |
+| Agent thinking (LLM call) | Reject with `model swap queued — will apply after current turn`; apply after current turn ends |
+| Running bash | Same — queue, apply after |
+| Active `ask` form | Reject with `dismiss form first`; user must answer or Ctrl-C the ask form |
+
+This sidesteps the smolagents-internal complexity of swapping `agent.model`
+while a `run()` is mid-flight. (We tried — it segfaults on partial
+streaming-response state in some smolagents versions.)
+
+### Audit
+
+New event:
+
+| Event | Fields | When |
+|---|---|---|
+| `model_switch` | `from`, `to`, `source` (`/model` / `/model save` / install) | Right before `agent.model = new_model` takes effect |
+
+The audit log already captures `model` in `session_start`; the new event
+documents intra-session changes so a post-hoc reader can trace which
+model handled which turn.
+
+### Why not a full `/config` or `/set` shell
+
+Considered, rejected. Operators wanted:
+
+> "I want to flip the model. The other config rarely changes."
+
+A general `/set provider=...` is a footgun — provider change implies key
+change implies endpoint check; we'd be reimplementing install.sh inside
+a chat. Keep `/model` narrow; add `/endpoint` or `/key` later only if
+demand actually emerges.
+
+## 12. `!` prefix — direct bash execution, skip the LLM
+
+### Symptom
+
+Operator types something they know is a shell command (`ls /etc/nginx`,
+`tail -f /var/log/syslog`, `git status`). The agent currently routes
+it through the LLM, which:
+
+- Costs tokens for trivial reformulation.
+- Adds 1–4 seconds of LLM round-trip on top of a sub-second command.
+- Sometimes the LLM second-guesses the operator (asks for confirmation,
+  rewrites the command "safer", etc.) when the operator just wanted to
+  see the raw output.
+
+Other AI shells solve this with a sigil prefix. We adopt the same.
+
+### Acceptance shape
+
+A line starting with `!` (with or without leading whitespace) is
+handled as a **direct bash invocation** — the rest of the line goes
+straight through `tool_bash` without the LLM ever seeing it. Output
+streams into the top region exactly like a normal `bash` tool call,
+and the same audit chain fires (`bash_pre_exec` → `tool_call`).
+
+Examples:
+
+| Input | Interpretation |
+|---|---|
+| `!ls /etc/nginx` | exec `ls /etc/nginx` directly |
+| `! tail -n 20 /var/log/syslog` | exec `tail -n 20 /var/log/syslog` (leading space tolerated) |
+| `!!` | re-run last `!` command (bash-style, optional v2 feature) |
+| `please !ls` | NOT a direct exec — `!` not at start |
+| `\!ls` | `\!` escapes the sigil; treated as English ("!ls") |
+
+Audit log captures the source: `tool_call.source = "direct"` (vs.
+default `"llm"`) so retrospective reads can distinguish operator-typed
+commands from LLM-generated ones.
+
+### Safety
+
+Doesn't bypass the locked confirmation rule because there's no LLM in
+the loop to decide — the operator is explicitly invoking. We trust
+operator intent for direct exec; same risk surface as a regular shell.
+The `bash_pre_exec` audit event still fires, so destructive direct
+commands are still recorded.
+
+`ask` form behavior under direct exec: not invoked. Operators using
+the sigil have opted out of the confirmation chokepoint by design.
+Document this clearly in `/help`.
+
+### Why not just expose a separate `/bash` slash command
+
+`/bash ls` works as a model but is twice as many keystrokes. The `!`
+sigil is the universally-recognized "I want shell" signal (csh, bash,
+fish, vi `:!`, jupyter, many AI shells). Keep the friction low.
+
+## 13. Current-folder indicator in the TUI
+
+### Symptom
+
+The `bash` tool's working directory is `/home/agent` by default but
+the LLM can `cd` mid-session (within a single `bash` call) — and
+when operators use `!` (§12) for direct exec, they often want to
+chain commands assuming the same cwd as the last one. Without a
+visible cwd, they're guessing.
+
+Even without `!`, operators benefit from knowing where the agent
+"is" — answers a frequent first question of "did it touch a file
+in /etc or in /tmp?".
+
+### Acceptance shape
+
+A cwd chip in the **status bar** (1 row, already present):
+
+```
+◐ idle · /home/agent · ctx 12%
+```
+
+For long paths, abbreviate via standard shell rules: replace `$HOME`
+with `~`, truncate middle with `…` once total length exceeds ~30
+chars. Examples:
+
+| Real cwd | Displayed |
+|---|---|
+| `/home/agent` | `~` |
+| `/home/agent/projects/x` | `~/projects/x` |
+| `/var/log/opsbridge/agent` | `/var/log/opsbridge/agent` |
+| `/usr/share/very/deep/nested/path/here` | `/usr/share/…/path/here` |
+
+### Tracking the agent's cwd
+
+`tool_bash` already passes `cwd=DEFAULT_BASH_CWD`. But the child shell
+may `cd` inside the command (`cd /tmp && do_thing`). The parent
+process's cwd doesn't change — but the operator's mental model says it
+did.
+
+Two implementation options:
+
+1. **Honest mode**: status bar shows the cwd `tool_bash` was called
+   WITH (always `/home/agent` unless we change defaults). Simple.
+   Doesn't track in-command `cd`.
+2. **Sticky mode**: at the end of each bash call, run `pwd` in the
+   same subshell and capture it. Persist as the next call's cwd.
+
+Sticky mode matches operator expectations (`!cd /tmp` followed by
+`!ls` should ls /tmp). Implementation: append `; pwd 1>&3` with
+fd 3 captured separately to a `cwd_track` variable.
+
+### Source of truth
+
+Sticky-tracked cwd is **per-session**, never persisted to config.
+Resets to `/home/agent` (or whatever the install configured) on next
+SSH login.
+
+## 14. `/help` slash command
+
+### Symptom
+
+Operators discover features by reading docs, dogfooding, or asking
+in chat. Even the existing `/quit`, `/exit`, `/q` aren't documented
+anywhere the operator can see at runtime.
+
+### Acceptance shape
+
+`/help` (or `/?`) prints a one-screen reference into the top region:
+
+```
+[help] OpsBridge slash commands
+
+  /model           open model picker (paginated)
+  /model <id>      switch to <id> for this session
+  /model save <id> switch and persist to config.toml
+  /quit /exit /q   end the session
+  /help /?         show this help
+
+Direct exec:
+  !<cmd>           run <cmd> via bash, skipping the LLM
+                   (e.g. !tail -f /var/log/syslog)
+
+Hotkeys:
+  Ctrl-D ×2        quit (first press arms; second within 2s exits)
+  Ctrl-C           cancel current ask form / running bash
+  ↑ / ↓            input history
+
+Audit log:
+  /var/log/opsbridge/agent/<session-id>.jsonl
+
+Preferences:
+  /etc/opsbridge/agent/preferences.md  (mutate only via `remember`)
+```
+
+Help text is hand-curated, not auto-generated — it's faster to read
+than a reflection-based dump and we control the wording. Versioned
+with the code (lives in `tui.py` as a constant or a `.help.md`
+resource file).
+
+### Why not embed help in the system prompt
+
+Tempting (would let `what can I do?` route via the LLM). But:
+
+- Adds ~150 tokens to every call, every turn, forever.
+- LLM might paraphrase or misremember the exact key/command names.
+- `/help` should be available without an LLM call (offline, rate-
+  limited, key-rotated mid-session, etc.).
+
+Keep the operator-facing reference structural; let the LLM handle
+"what can the agent do for me" via the existing system prompt.
+
 ---
 
 ## Priority
@@ -410,6 +667,10 @@ For the next phase planning:
 | 8 | stderr discipline regression test | low |
 | 9 | Orphan-process documentation/doctor | low |
 | 10 | Wide-char (CJK/emoji) backspace residue | **high** (CJK operators) |
+| 11 | `/model` slash command (with pagination) | medium (quality-of-life, operator-requested) |
+| 12 | `!` prefix for direct bash execution | medium (operator-requested) |
+| 13 | Current-folder indicator in status bar | medium (operator-requested) |
+| 14 | `/help` slash command | low (discoverability; trivial implementation) |
 
 §1 + §2 + §3 are the "operators don't feel safe" cluster — should be
 the bulk of Phase 3 if there's a Phase 3. §4 is a system-prompt change
