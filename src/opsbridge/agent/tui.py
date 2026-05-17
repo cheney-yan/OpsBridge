@@ -258,9 +258,9 @@ def _render_form(state: _AskState) -> str:
 HELP_TEXT = """\
 [help] OpsBridge slash commands
 
-  /model              open paginated model picker
-  /model <id>         switch directly to <id> (session-only)
-  /model save <id>    switch AND persist to /etc/opsbridge/agent/config.toml
+  /model              open paginated model picker (picks persist)
+  /model <id>         switch to <id> AND persist to config.toml
+  /model session <id> switch for this session only (no config write)
   /quit /exit /q      end the session
   /help /?            show this help
 
@@ -823,8 +823,11 @@ class OpsBridgeApp(App):
     def _handle_model_command(self, args: str) -> None:
         """Dispatch /model parsing.
 
-        args is whatever follows `/model` (empty = open picker; `<id>` =
-        swap; `save <id>` = swap + persist).
+        Forms (post operator-feedback rebalance: persist is the new default):
+          /model                     → open picker (picks persist)
+          /model <id>                → swap AND persist to config.toml
+          /model session <id>        → swap for this session only
+          /model save <id>           → alias for `/model <id>` (back-compat)
         """
         if self._on_model_swap is None:
             self.write_top("[/model] not available (no agent wired)", kind="system")
@@ -835,6 +838,17 @@ class OpsBridgeApp(App):
             return
 
         parts = args.split(maxsplit=1)
+
+        # `session <id>` → session-only swap (explicit opt-out of persist).
+        if parts[0] == "session" and len(parts) == 2:
+            new_id = parts[1].strip()
+            if new_id:
+                self.write_top(f"[/model] switching to {new_id} (session only)", kind="system")
+                self._on_model_swap(new_id, False)
+                self._do_set_model(new_id)
+            return
+
+        # `save <id>` → kept as an alias for explicit persist (back-compat).
         if parts[0] == "save" and len(parts) == 2:
             new_id = parts[1].strip()
             if new_id:
@@ -843,11 +857,11 @@ class OpsBridgeApp(App):
                 self._do_set_model(new_id)
             return
 
-        # Plain `/model <id>` — session-only swap.
+        # Plain `/model <id>` — persist by default.
         new_id = args.strip()
         if new_id:
-            self.write_top(f"[/model] switching to {new_id}", kind="system")
-            self._on_model_swap(new_id, False)
+            self.write_top(f"[/model] switching to {new_id} (persist)", kind="system")
+            self._on_model_swap(new_id, True)
             self._do_set_model(new_id)
 
     def _open_model_picker(self) -> None:
@@ -904,9 +918,11 @@ class OpsBridgeApp(App):
             pass
         self._do_set_status("idle")
         if applied and self._on_model_swap is not None:
-            self._on_model_swap(applied, False)
+            # Picker selections persist by default — matches /model <id>
+            # semantics and the operator-feedback "lock it in" intent.
+            self._on_model_swap(applied, True)
             self._do_set_model(applied)
-            self.write_top(f"[/model] switched to {applied}", kind="system")
+            self.write_top(f"[/model] switched to {applied} (persisted)", kind="system")
         # Hand focus back to the input line so the operator can keep typing.
         try:
             self.query_one(Input).focus()

@@ -179,7 +179,9 @@ class TestRenderPicker:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_slash_model_with_id_calls_on_model_swap():
+async def test_slash_model_with_id_persists_by_default():
+    """`/model <id>` persists to config.toml by default (operator-feedback
+    rebalance: most operators want the choice to stick across sessions)."""
     swaps: list[tuple[str, bool]] = []
     app = OpsBridgeApp(
         hostname="h", model_label="old-model",
@@ -190,11 +192,28 @@ async def test_slash_model_with_id_calls_on_model_swap():
     async with app.run_test() as pilot:
         await pilot.press(*list("/model new-id"), "enter")
         await pilot.pause()
+    assert swaps == [("new-id", True)]
+
+
+@pytest.mark.asyncio
+async def test_slash_model_session_keyword_skips_persist():
+    """`/model session <id>` explicitly opts out of persistence."""
+    swaps: list[tuple[str, bool]] = []
+    app = OpsBridgeApp(
+        hostname="h", model_label="old",
+        on_operator_turn=lambda _t: None,
+        on_cancel=lambda: None,
+        on_model_swap=lambda mid, persist: swaps.append((mid, persist)),
+    )
+    async with app.run_test() as pilot:
+        await pilot.press(*list("/model session new-id"), "enter")
+        await pilot.pause()
     assert swaps == [("new-id", False)]
 
 
 @pytest.mark.asyncio
-async def test_slash_model_save_persists():
+async def test_slash_model_save_still_persists_back_compat():
+    """`/model save <id>` is kept as an alias for the explicit-persist form."""
     swaps: list[tuple[str, bool]] = []
     app = OpsBridgeApp(
         hostname="h", model_label="old",
@@ -227,6 +246,7 @@ async def test_bare_slash_model_opens_picker():
 
 @pytest.mark.asyncio
 async def test_picker_digit_pick_applies():
+    """Picker selections persist by default (matches /model <id>)."""
     swaps: list[tuple[str, bool]] = []
     models = ["a", "b", "c", "d"]
     app = OpsBridgeApp(
@@ -241,7 +261,7 @@ async def test_picker_digit_pick_applies():
         await pilot.pause()
         await pilot.press("3")
         await pilot.pause()
-    assert swaps == [("c", False)]
+    assert swaps == [("c", True)]
     assert app._active_picker is None
 
 
