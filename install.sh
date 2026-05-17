@@ -187,13 +187,165 @@ log "bootstrap (uv + venv) ..."
 # config in bash and feeding `opsbridge install` via env vars (the existing
 # non-interactive code path).
 
+# Read a secret with visible `*` echo per character (instead of `read -s`'s
+# total silence). Supports Backspace (erase one `*`). Result goes into the
+# global REPLY variable, mirroring bash's stock `read`.
+read_secret_starred() {
+    local prompt="$1"
+    local secret="" char
+    printf '%s' "$prompt"
+    # `IFS=` keeps leading whitespace; -r preserves backslashes; -s suppresses
+    # bash's own echo; -n1 reads ONE char. On Enter, bash strips the \n and
+    # read returns empty, which we treat as end-of-input.
+    while IFS= read -r -s -n1 char; do
+        if [[ -z "$char" ]]; then
+            break
+        fi
+        case "$char" in
+            $'\x7f'|$'\b')
+                # DEL or BS — erase one char from buffer + one `*` from screen.
+                if [[ -n "$secret" ]]; then
+                    secret="${secret%?}"
+                    printf '\b \b'
+                fi
+                ;;
+            *)
+                secret+="$char"
+                printf '*'
+                ;;
+        esac
+    done
+    printf '\n'
+    REPLY="$secret"
+}
+
+# Query the configured LLM endpoint for its `/v1/models` list. Echoes one
+# model id per line on stdout. Exits non-zero (and produces empty output)
+# if the call fails — caller falls back to typing the name manually.
+discover_models() {
+    local base="${OPSBRIDGE_BASE_URL:-}"
+    local provider="$OPSBRIDGE_PROVIDER"
+    local key="$OPSBRIDGE_API_KEY"
+
+    if [[ -z "$base" ]]; then
+        if [[ "$provider" == "openai" ]]; then
+            base="https://api.openai.com/v1"
+        else
+            # Anthropic vendor doesn't expose an OpenAI-style /v1/models that
+            # we'd want to depend on; return a hardcoded short-list instead.
+            printf 'claude-haiku-4-5\nclaude-sonnet-4-6\nclaude-opus-4-7\n'
+            return 0
+        fi
+    fi
+    base="${base%/}"
+
+    local resp
+    resp=$(curl -fsS -m 10 -H "Authorization: Bearer $key" "$base/models" 2>/dev/null) || return 1
+    [[ -z "$resp" ]] && return 1
+
+    # Pull model ids out of the JSON. Python is reliable; grep is the fallback.
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s' "$resp" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    items = data.get("data", data) if isinstance(data, dict) else data
+    for m in items or []:
+        mid = m.get("id") or m.get("name") if isinstance(m, dict) else m
+        if mid:
+            print(mid)
+except Exception:
+    pass
+'
+    else
+        printf '%s' "$resp" | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' | sed 's/.*"\([^"]\+\)".*/\1/'
+    fi
+}
+
+# Pick a default model id from a list based on provider hints. Falls back
+# to the first entry if no hint matches, or to a hardcoded provider default
+# if the list is empty.
+default_model_from_list() {
+    local provider="$1"
+    local models="$2"
+    local pick=""
+    case "$provider" in
+        anthropic)
+            pick=$(printf '%s\n' "$models" | grep -E '^claude-sonnet' | tail -1)
+            [[ -z "$pick" ]] && pick=$(printf '%s\n' "$models" | grep -iE 'sonnet' | head -1)
+            ;;
+        openai)
+            pick=$(printf '%s\n' "$models" | grep -E '^gpt-[0-9].*mini$' | tail -1)
+            [[ -z "$pick" ]] && pick=$(printf '%s\n' "$models" | grep -E '^gpt-' | head -1)
+            ;;
+    esac
+    [[ -z "$pick" ]] && pick=$(printf '%s\n' "$models" | head -1)
+    if [[ -z "$pick" ]]; then
+        case "$provider" in
+            openai)    pick="gpt-4.1-mini" ;;
+            anthropic) pick="claude-sonnet-4-6" ;;
+        esac
+    fi
+    echo "$pick"
+}
+
+# Ask the operator to pick a model, after we have URL + key (so we can
+# discover what the endpoint actually serves). Falls back gracefully to
+# free-text entry when discovery fails.
+prompt_for_model() {
+    local provider="$OPSBRIDGE_PROVIDER"
+    local models default
+
+    log "discovering models from ${OPSBRIDGE_BASE_URL:-the vendor's default endpoint} ..."
+    models=$(discover_models 2>/dev/null) || true
+    if [[ -z "$models" ]]; then
+        warn "  couldn't fetch /v1/models — type a model id manually."
+        case "$provider" in
+            openai)    default="gpt-4.1-mini" ;;
+            anthropic) default="claude-sonnet-4-6" ;;
+        esac
+        read -r -p "Model [$default]: " model
+        OPSBRIDGE_MODEL="${model:-$default}"
+        export OPSBRIDGE_MODEL
+        return 0
+    fi
+
+    default=$(default_model_from_list "$provider" "$models")
+    echo
+    log "Available models (numbered list, recommended starred):"
+    local arr=() i=1 m
+    while IFS= read -r m; do
+        [[ -z "$m" ]] && continue
+        arr+=("$m")
+        if [[ "$m" == "$default" ]]; then
+            printf '  %2d. %s ★ recommended\n' "$i" "$m"
+        else
+            printf '  %2d. %s\n' "$i" "$m"
+        fi
+        ((i++))
+        [[ "$i" -gt 15 ]] && { printf '  ... (%d more)\n' $(($(printf '%s\n' "$models" | wc -l) - 15)); break; }
+    done <<< "$models"
+    echo
+    local choice
+    read -r -p "Pick a number, or paste a model id [default: $default]: " choice
+    if [[ -z "$choice" ]]; then
+        OPSBRIDGE_MODEL="$default"
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#arr[@]} )); then
+        OPSBRIDGE_MODEL="${arr[$((choice-1))]}"
+    else
+        OPSBRIDGE_MODEL="$choice"
+    fi
+    export OPSBRIDGE_MODEL
+    echo "  selected: $OPSBRIDGE_MODEL"
+}
+
 prompt_for_config() {
     echo
     log "Configure LLM"
 
-    local provider model base_url api_key jina_key
+    local provider base_url jina_key
 
-    # Provider — validate against the supported set.
+    # 1. Provider — drives default base URL + model-list discovery path.
     while :; do
         read -r -p "Provider [anthropic/openai] [anthropic]: " provider
         provider=${provider:-anthropic}
@@ -202,46 +354,37 @@ prompt_for_config() {
             *) echo "  must be 'openai' or 'anthropic'" >&2 ;;
         esac
     done
+    export OPSBRIDGE_PROVIDER="$provider"
 
-    # Model — provider-specific defaults.
-    local default_model
-    case "$provider" in
-        openai)    default_model="gpt-4.1-mini" ;;
-        anthropic) default_model="claude-sonnet-4-6" ;;
-    esac
-    read -r -p "Model [$default_model]: " model
-    model=${model:-$default_model}
-
-    # Base URL (optional; empty = vendor's official endpoint).
+    # 2. Base URL — optional, empty = vendor's official endpoint.
     read -r -p "Custom base URL (empty = official): " base_url
+    export OPSBRIDGE_BASE_URL="$base_url"
 
-    # API key — required, hidden. Loop until non-empty. We DO echo a masked
-    # form back after capture so the operator knows the paste worked (silent
-    # hidden input + a separate api.key file is way too easy to misread as
-    # "did it even save?").
+    # 3. API key — required, hidden with per-char `*` echo so the operator
+    # sees their keystrokes land. After Enter we ALSO show a masked summary
+    # of the captured value, since the file it'll land in is separate from
+    # config.toml and a silent capture invites "did it even save?".
     while :; do
-        read -r -s -p "Paste API key (hidden, will mask back after Enter): " api_key
-        echo
-        if [[ -z "$api_key" ]]; then
+        read_secret_starred "Paste API key: "
+        if [[ -z "$REPLY" ]]; then
             echo "  API key cannot be empty" >&2
             continue
         fi
-        echo "  captured: $(_mask "$api_key")  → /etc/opsbridge/agent/api.key (mode 0400, owned by agent)"
+        export OPSBRIDGE_API_KEY="$REPLY"
+        echo "  captured: $(_mask "$OPSBRIDGE_API_KEY")  → /etc/opsbridge/agent/api.key (mode 0400, owned by agent)"
         break
     done
 
-    # Jina API key — optional, hidden.
-    read -r -s -p "Jina API key for 'visit' (empty = skip): " jina_key
-    echo
-    if [[ -n "$jina_key" ]]; then
-        echo "  captured: $(_mask "$jina_key")  → /etc/opsbridge/agent/config.toml [visit]"
-    fi
+    # 4. Model — now that we have URL + key, query /v1/models and offer
+    # a numbered pick instead of asking the operator to remember names.
+    prompt_for_model
 
-    export OPSBRIDGE_PROVIDER="$provider"
-    export OPSBRIDGE_MODEL="$model"
-    export OPSBRIDGE_BASE_URL="$base_url"
-    export OPSBRIDGE_API_KEY="$api_key"
-    export OPSBRIDGE_JINA_API_KEY="$jina_key"
+    # 5. Jina key — optional, hidden, also with `*` echo.
+    read_secret_starred "Jina API key for 'visit' (empty = skip): "
+    export OPSBRIDGE_JINA_API_KEY="$REPLY"
+    if [[ -n "$OPSBRIDGE_JINA_API_KEY" ]]; then
+        echo "  captured: $(_mask "$OPSBRIDGE_JINA_API_KEY")  → /etc/opsbridge/agent/config.toml [visit]"
+    fi
 }
 
 # Mask a secret for confirmation echo. Shows `aaaa…zzzz (N chars)` for
