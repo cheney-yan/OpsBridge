@@ -219,6 +219,46 @@ read_secret_starred() {
     REPLY="$secret"
 }
 
+# Auto-correct OPSBRIDGE_BASE_URL when the operator forgot the `/v1` suffix.
+# Most OpenAI-compatible proxies (cliapi, vLLM, litellm-gateway, …) live at
+# `<host>/v1/...`, but the value the operator pastes from a vendor's website
+# often omits it. Probing /models with curl is cheap and discriminates the
+# two layouts: as-given → if 2xx we keep it; otherwise try `<url>/v1/models`
+# and rewrite OPSBRIDGE_BASE_URL on success.
+#
+# We DON'T treat probe failure as fatal — discover_models / check_llm_endpoint
+# will surface the real error later with response body + fix hints.
+normalize_base_url() {
+    local base="${OPSBRIDGE_BASE_URL:-}"
+    [[ -z "$base" ]] && return 0   # vendor default; nothing to normalize
+    local key="$OPSBRIDGE_API_KEY"
+    base="${base%/}"
+
+    # As-given /models — happy path, nothing to do.
+    if curl -fsS -m 8 -o /dev/null -H "Authorization: Bearer $key" "$base/models" 2>/dev/null; then
+        OPSBRIDGE_BASE_URL="$base"
+        export OPSBRIDGE_BASE_URL
+        return 0
+    fi
+
+    # If the URL doesn't already end in /vN, try appending /v1.
+    if [[ ! "$base" =~ /v[0-9]+$ ]]; then
+        if curl -fsS -m 8 -o /dev/null -H "Authorization: Bearer $key" "$base/v1/models" 2>/dev/null; then
+            log "  base URL auto-corrected: $base → $base/v1"
+            OPSBRIDGE_BASE_URL="$base/v1"
+            export OPSBRIDGE_BASE_URL
+            return 0
+        fi
+    fi
+
+    # Neither layout works. Leave the value the operator typed and let
+    # downstream tools (discover_models, check_llm_endpoint) report it
+    # with their normal error hints.
+    OPSBRIDGE_BASE_URL="$base"
+    export OPSBRIDGE_BASE_URL
+    return 1
+}
+
 # Query the configured LLM endpoint for its `/v1/models` list. Echoes one
 # model id per line on stdout. Exits non-zero (and produces empty output)
 # if the call fails — caller falls back to typing the name manually.
@@ -357,8 +397,9 @@ prompt_for_config() {
     done
     export OPSBRIDGE_PROVIDER="$provider"
 
-    # 2. Base URL — optional, empty = vendor's official endpoint.
-    read -r -p "Custom base URL (empty = official): " base_url
+    # 2. Base URL — optional, empty = vendor's official endpoint. We probe
+    # /models below to auto-append /v1 if the operator forgot it.
+    read -r -p "Custom base URL (empty = official; include /v1 if your proxy uses it): " base_url
     export OPSBRIDGE_BASE_URL="$base_url"
 
     # 3. API key — required, hidden with per-char `*` echo so the operator
@@ -376,8 +417,14 @@ prompt_for_config() {
         break
     done
 
-    # 4. Model — now that we have URL + key, query /v1/models and offer
-    # a numbered pick instead of asking the operator to remember names.
+    # 3b. Normalize base URL — common operator typo: omitting `/v1`. Probe
+    # the as-given URL first; if /models 404s but /v1/models works, silently
+    # auto-correct (with a visible log line) so downstream steps don't
+    # cascade-fail. Skipped when no base URL was provided (vendor default).
+    normalize_base_url || true
+
+    # 4. Model — now that we have URL + key (and a corrected URL if the
+    # operator forgot /v1), query /models and offer a numbered pick.
     prompt_for_model
 
     # 5. Jina key — optional, hidden, also with `*` echo.
