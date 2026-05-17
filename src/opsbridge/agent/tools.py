@@ -964,13 +964,13 @@ class BashTool(Tool):
         t0 = time.monotonic()
         sink: Callable[[str], None] | None = None
         if self._app is not None:
-            # Echo: `$ ...` for LLM-routed, `! ...` for direct (already echoed
-            # by the TUI's input handler in the direct case; but the agent
-            # thread does it for LLM-routed).
+            # Echo: `$ ...` for LLM-routed (the !-prefix path was echoed by
+            # the TUI's input handler with `! ...` styling already).
             if source == "llm":
-                self._app.write_top(f"$ {command}")
+                self._app.write_top(f"$ {command}", kind="bash_cmd")
             self._app.set_status("running bash")
-            sink = lambda line: self._app.write_top(line)
+            # Bash output lines use the default `bash_out` style (no tinting).
+            sink = lambda line: self._app.write_top(line, kind="bash_out")
 
         def _pre_exec() -> None:
             if self._logger:
@@ -1087,7 +1087,7 @@ class SearchTool(Tool):
             self._logger.emit("search_pre_exec", query=query, backend="web_search")
         if self._app is not None:
             try:
-                self._app.write_top(f"[search] {query!r}")
+                self._app.write_top(f"[search] {query!r}", kind="tool")
                 self._app.set_status("searching")
             except Exception:  # noqa: BLE001
                 pass
@@ -1095,7 +1095,7 @@ class SearchTool(Tool):
         result, meta = tool_search(query, max_results=max_results, backend=self._backend)
         if self._app is not None:
             try:
-                self._app.write_top(f"[search] → {meta.get('result_count', 0)} results")
+                self._app.write_top(f"[search] → {meta.get('result_count', 0)} results", kind="tool")
                 self._app.set_status("idle")
             except Exception:  # noqa: BLE001
                 pass
@@ -1148,7 +1148,7 @@ class VisitTool(Tool):
             self._logger.emit("visit_pre_exec", url=url)
         if self._app is not None:
             try:
-                self._app.write_top(f"[visit] {url}")
+                self._app.write_top(f"[visit] {url}", kind="tool")
                 self._app.set_status("visiting")
             except Exception:  # noqa: BLE001
                 pass
@@ -1163,7 +1163,8 @@ class VisitTool(Tool):
             try:
                 self._app.write_top(
                     f"[visit] ← {meta.get('bytes', 0)} bytes"
-                    + (" [truncated]" if meta.get("truncated") else "")
+                    + (" [truncated]" if meta.get("truncated") else ""),
+                    kind="tool",
                 )
                 self._app.set_status("idle")
             except Exception:  # noqa: BLE001

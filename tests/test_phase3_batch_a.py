@@ -195,7 +195,7 @@ class TestHelpText:
 @pytest.mark.asyncio
 async def test_slash_help_routes_to_top_log():
     """Typing /help adds the help-text lines to the top region."""
-    written: list[str] = []
+    written: list[tuple[str, str]] = []
 
     app = OpsBridgeApp(
         hostname="h",
@@ -204,14 +204,21 @@ async def test_slash_help_routes_to_top_log():
         on_cancel=lambda: None,
     )
     async with app.run_test() as pilot:
-        # Override _do_write_top to capture lines.
-        app._do_write_top = lambda line: written.append(line)
+        # Capture write_top calls (the styled API). Lines + their kind.
+        original = app.write_top
+
+        def capture(line: str, *, kind: str = "bash_out") -> None:
+            written.append((kind, line))
+            # Don't forward to original — avoid the call_from_thread race.
+
+        app.write_top = capture  # type: ignore[method-assign]
         await pilot.press("/", "h", "e", "l", "p", "enter")
         await pilot.pause()
-    # /help echoes the command itself + multi-line help body.
-    combined = "\n".join(written)
+    combined = "\n".join(line for _kind, line in written)
     assert "OpsBridge slash commands" in combined
     assert "/model" in combined
+    # Help body uses the `system` kind for the Subtle palette.
+    assert any(kind == "system" for kind, _line in written)
 
 
 @pytest.mark.asyncio

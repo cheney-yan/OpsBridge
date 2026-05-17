@@ -33,6 +33,27 @@ from textual.containers import Vertical
 from textual.reactive import reactive
 from textual.widgets import Input, RichLog, Static
 
+from rich.markup import escape as _rich_escape
+
+
+# ---------------------------------------------------------------------------
+# Top-region line styling (Subtle palette)
+# ---------------------------------------------------------------------------
+# Visual differentiation between operator input, AI agent response, bash
+# echo / output, and tool chatter (search / visit / system notices).
+# Subtle palette: tinted dim backgrounds for "human dialogue" (user + AI),
+# foreground accent only for bash command echo, dim foreground for tool
+# chatter and system notices. Avoids cognitive load on long sessions.
+
+_TOP_LOG_STYLES: dict[str, str] = {
+    "user":     "on grey15",            # operator input — slight blue-grey tint
+    "ai":       "on color(22)",          # AI response   — slight green tint
+    "bash_cmd": "bold cyan",             # `$ ...` command echo — accent fg
+    "bash_out": "",                       # bash output — base fg, no tinting
+    "tool":     "dim",                    # [search]/[visit]/etc. — muted fg
+    "system":   "yellow",                 # [help]/[queue full]/etc. — warm fg
+}
+
 try:
     from wcwidth import wcswidth as _wcswidth
 except ImportError:  # pragma: no cover — declared dependency
@@ -409,7 +430,11 @@ class OpsBridgeApp(App):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield TopLog(id="top_log", wrap=True, highlight=False, markup=False)
+            # markup=True so we can colorise per-line by `kind` (user / ai /
+            # bash_cmd / bash_out / tool / system) — see _TOP_LOG_STYLES.
+            # Untrusted bash output is escape()'d before insertion so
+            # square brackets in apt/dpkg output don't get parsed as tags.
+            yield TopLog(id="top_log", wrap=True, highlight=False, markup=True)
             yield MiddlePanel(id="middle")
             yield StatusBar(id="status")
         # WidthAwareInput (§10) — handles CJK/emoji backspace residue.
@@ -444,11 +469,41 @@ class OpsBridgeApp(App):
 
     # ----- public methods (called from agent thread via call_from_thread) -
 
-    def write_top(self, line: str) -> None:
-        """Append a line to the top region. Safe from any thread."""
+    def write_top(self, line: str, *, kind: str = "bash_out") -> None:
+        """Append a line to the top region, styled by `kind`.
+
+        Kinds (see _TOP_LOG_STYLES for the palette):
+          - user      operator-typed input (`> ...`)
+          - ai        AI agent narration / mid-turn response
+          - bash_cmd  `$ <command>` echo before exec
+          - bash_out  raw bash stdout/stderr (default — no styling)
+          - tool      [search] / [visit] / similar tool chatter
+          - system    [help] / [queue full] / [context …] notices
+
+        Safe from any thread. If called from the App's own loop thread
+        (e.g., from on_input_submitted), call_from_thread raises and we
+        fall through to a direct synchronous call.
+        """
+        style = _TOP_LOG_STYLES.get(kind, "")
+        escaped = _rich_escape(line)
+        formatted = f"[{style}]{escaped}[/{style}]" if style else escaped
         try:
-            self.call_from_thread(self._do_write_top, line)
+            self.call_from_thread(self._do_write_top, formatted)
+            return
         except RuntimeError:
+            pass
+        # Same-thread fallback (App handler invoking write_top directly).
+        # Distinguish "app running, just same-thread" from "app not started":
+        # if we can find the TopLog widget, write to it; else fall through
+        # to stdout (for unit tests / pre-mount calls).
+        try:
+            log = self.query_one(TopLog)
+        except Exception:  # noqa: BLE001 — no app / widget not in tree yet
+            print(line)
+            return
+        try:
+            log.write(formatted)
+        except Exception:  # noqa: BLE001
             print(line)
 
     def _do_write_top(self, line: str) -> None:
@@ -645,7 +700,7 @@ class OpsBridgeApp(App):
         key = event.key
         if key == "escape":
             self._close_picker(None)
-            self._do_write_top("[/model] cancelled")
+            self.write_top("[/model] cancelled", kind="system")
             event.stop()
             return
         if key == "enter":
@@ -700,9 +755,9 @@ class OpsBridgeApp(App):
             self.exit()
             return
         if stripped in ("/help", "/?"):
-            self._do_write_top(f"> {stripped}")
+            self.write_top(f"> {stripped}", kind="user")
             for line in HELP_TEXT.splitlines():
-                self._do_write_top(line)
+                self.write_top(line, kind="system")
             return
 
         # /model — §11. Three forms:
@@ -710,16 +765,17 @@ class OpsBridgeApp(App):
         #   /model <id>          → swap directly (session-only)
         #   /model save <id>     → swap AND persist to config.toml
         if stripped == "/model" or stripped.startswith("/model "):
-            self._do_write_top(f"> {stripped}")
+            self.write_top(f"> {stripped}", kind="user")
             self._handle_model_command(stripped[len("/model"):].strip())
             return
 
         # §5: bound the queue. Past MAX_QUEUE_DEPTH, refuse new turns
         # with a polite hint pointing to Ctrl-C as the escape.
         if self._in_flight >= self.MAX_QUEUE_DEPTH:
-            self._do_write_top(
+            self.write_top(
                 f"[queue full — {self._in_flight} pending. "
-                "Press Ctrl-C to cancel the current task before queuing more.]"
+                "Press Ctrl-C to cancel the current task before queuing more.]",
+                kind="system",
             )
             return
 
@@ -735,7 +791,7 @@ class OpsBridgeApp(App):
             queue_hint = (
                 f"  (queued — {self._in_flight - 1} ahead)" if self._in_flight > 1 else ""
             )
-            self._do_write_top(f"! {cmd}{queue_hint}")
+            self.write_top(f"! {cmd}{queue_hint}", kind="user")
             if self._on_direct_bash is not None:
                 self._on_direct_bash(cmd)
             return
@@ -745,7 +801,7 @@ class OpsBridgeApp(App):
         queue_hint = (
             f"  (queued — {self._in_flight - 1} ahead)" if self._in_flight > 1 else ""
         )
-        self._do_write_top(f"> {text}{queue_hint}")
+        self.write_top(f"> {text}{queue_hint}", kind="user")
         self._do_set_final_answer("")
         self._do_set_status("thinking")
         self._on_operator_turn(text)
@@ -759,7 +815,7 @@ class OpsBridgeApp(App):
         swap; `save <id>` = swap + persist).
         """
         if self._on_model_swap is None:
-            self._do_write_top("[/model] not available (no agent wired)")
+            self.write_top("[/model] not available (no agent wired)", kind="system")
             return
 
         if not args:
@@ -770,7 +826,7 @@ class OpsBridgeApp(App):
         if parts[0] == "save" and len(parts) == 2:
             new_id = parts[1].strip()
             if new_id:
-                self._do_write_top(f"[/model] switching to {new_id} (persist)")
+                self.write_top(f"[/model] switching to {new_id} (persist)", kind="system")
                 self._on_model_swap(new_id, True)
                 self._do_set_model(new_id)
             return
@@ -778,7 +834,7 @@ class OpsBridgeApp(App):
         # Plain `/model <id>` — session-only swap.
         new_id = args.strip()
         if new_id:
-            self._do_write_top(f"[/model] switching to {new_id}")
+            self.write_top(f"[/model] switching to {new_id}", kind="system")
             self._on_model_swap(new_id, False)
             self._do_set_model(new_id)
 
@@ -791,7 +847,7 @@ class OpsBridgeApp(App):
             except Exception:  # noqa: BLE001
                 models = []
         if not models:
-            self._do_write_top("[/model] couldn't discover models — type `/model <id>` to set manually")
+            self.write_top("[/model] couldn't discover models — type `/model <id>` to set manually", kind="system")
             return
         # Highlight the currently-active model.
         try:
@@ -838,7 +894,7 @@ class OpsBridgeApp(App):
         if applied and self._on_model_swap is not None:
             self._on_model_swap(applied, False)
             self._do_set_model(applied)
-            self._do_write_top(f"[/model] switched to {applied}")
+            self.write_top(f"[/model] switched to {applied}", kind="system")
         # Hand focus back to the input line so the operator can keep typing.
         try:
             self.query_one(Input).focus()
@@ -851,7 +907,7 @@ class OpsBridgeApp(App):
             return
         if self._active_picker is not None:
             self._close_picker(None)
-            self._do_write_top("[/model] cancelled")
+            self.write_top("[/model] cancelled", kind="system")
             return
         self._on_cancel()
         self._do_set_status("idle")
@@ -867,8 +923,9 @@ class OpsBridgeApp(App):
             self.exit()
             return
         self._quit_armed_at = now
-        self._do_write_top(
-            f"[press Ctrl-D again within {int(self.QUIT_ARM_WINDOW_SEC)}s to quit · or type /quit]"
+        self.write_top(
+            f"[press Ctrl-D again within {int(self.QUIT_ARM_WINDOW_SEC)}s to quit · or type /quit]",
+            kind="system",
         )
 
 

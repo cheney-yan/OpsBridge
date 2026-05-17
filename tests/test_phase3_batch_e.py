@@ -19,45 +19,53 @@ from opsbridge import admin
 # §5 — Queue visibility
 # ---------------------------------------------------------------------------
 
+def _attach_write_top_capture(app, written: list[tuple[str, str]]) -> None:
+    """Replace app.write_top with a synchronous list-appending stub."""
+    def capture(line: str, *, kind: str = "bash_out") -> None:
+        written.append((kind, line))
+    app.write_top = capture  # type: ignore[method-assign]
+
+
 @pytest.mark.asyncio
 async def test_first_submit_no_queue_hint():
-    written: list[str] = []
+    written: list[tuple[str, str]] = []
     app = OpsBridgeApp(
         hostname="h", model_label="m",
         on_operator_turn=lambda _t: None,
         on_cancel=lambda: None,
     )
     async with app.run_test() as pilot:
-        app._do_write_top = lambda line: written.append(line)
+        _attach_write_top_capture(app, written)
         await pilot.press(*list("hello"), "enter")
         await pilot.pause()
-    assert "> hello" in written
-    assert not any("queued" in l for l in written)
+    user_echoes = [line for kind, line in written if kind == "user"]
+    assert any("> hello" in l for l in user_echoes)
+    assert not any("queued" in l for _k, l in written)
 
 
 @pytest.mark.asyncio
 async def test_second_submit_while_busy_marks_queued():
-    written: list[str] = []
+    written: list[tuple[str, str]] = []
     app = OpsBridgeApp(
         hostname="h", model_label="m",
         on_operator_turn=lambda _t: None,
         on_cancel=lambda: None,
     )
     async with app.run_test() as pilot:
-        app._do_write_top = lambda line: written.append(line)
+        _attach_write_top_capture(app, written)
         await pilot.press(*list("first"), "enter")
         await pilot.pause()
         # Don't notify_turn_done — agent is still "busy".
         await pilot.press(*list("second"), "enter")
         await pilot.pause()
-    second_echo = next(l for l in written if "second" in l)
+    second_echo = next(l for _k, l in written if "second" in l)
     assert "queued" in second_echo
     assert "1 ahead" in second_echo
 
 
 @pytest.mark.asyncio
 async def test_queue_full_rejection_at_max_depth():
-    written: list[str] = []
+    written: list[tuple[str, str]] = []
     sent: list[str] = []
     app = OpsBridgeApp(
         hostname="h", model_label="m",
@@ -65,7 +73,7 @@ async def test_queue_full_rejection_at_max_depth():
         on_cancel=lambda: None,
     )
     async with app.run_test() as pilot:
-        app._do_write_top = lambda line: written.append(line)
+        _attach_write_top_capture(app, written)
         for i in range(app.MAX_QUEUE_DEPTH):
             await pilot.press(*list(f"q{i}"), "enter")
             await pilot.pause()
@@ -74,7 +82,7 @@ async def test_queue_full_rejection_at_max_depth():
         await pilot.pause()
     assert len(sent) == app.MAX_QUEUE_DEPTH
     assert "over" not in sent
-    assert any("queue full" in l for l in written)
+    assert any("queue full" in l for _k, l in written)
 
 
 @pytest.mark.asyncio

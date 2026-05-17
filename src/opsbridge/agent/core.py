@@ -580,13 +580,13 @@ def _run_tui_session(
             still fires; the cwd indicator follows the command across calls.
             """
             if bash_tool is None:
-                app.write_top("[!] bash tool not wired in this session")
+                app.write_top("[!] bash tool not wired in this session", kind="system")
                 app.notify_turn_done()
                 return
             try:
                 bash_tool.run_direct(cmd)
             except Exception as exc:  # noqa: BLE001
-                app.write_top(f"[! error] {exc}")
+                app.write_top(f"[! error] {exc}", kind="system")
                 logger.emit("direct_bash_error", command=cmd, error=str(exc))
             finally:
                 app.notify_turn_done()
@@ -707,16 +707,16 @@ def _run_tui_session(
                 app.notify_turn_done()
 
                 if not bundle.budget.warned_soft and bundle.budget.ratio >= SOFT_THRESHOLD:
-                    app.write_top(f"[context: {pct}% used]")
+                    app.write_top(f"[context: {pct}% used]", kind="system")
                     bundle.budget.warned_soft = True
                 if not bundle.budget.compressed_once and bundle.budget.ratio >= COMPRESS_THRESHOLD:
                     # Note the compress-LLM-call BEFORE it runs — Phase 2 only
                     # surfaced it after, leaving the operator wondering why
                     # the agent went quiet for ~3s.
-                    app.write_top("[context compressing — summarizing older steps]")
+                    app.write_top("[context compressing — summarizing older steps]", kind="system")
                     _try_compress_memory(bundle.agent, bundle.model, logger)
                     bundle.budget.compressed_once = True
-                    app.write_top("[context compressed — older steps summarized]")
+                    app.write_top("[context compressed — older steps summarized]", kind="system")
 
             try:
                 app.call_from_thread(app.exit)
