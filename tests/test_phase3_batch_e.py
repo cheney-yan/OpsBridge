@@ -293,3 +293,80 @@ class TestWidthAwareInput:
             # Didn't raise = pass. As a bonus check, the pasted text should
             # have landed in the input value.
             assert "服务器" in inp.value
+
+
+# ---------------------------------------------------------------------------
+# Ctrl-C cascade — Claude-Code-style semantics
+# ---------------------------------------------------------------------------
+
+class TestCtrlCCascade:
+    """Ctrl-C never quits. It cascades:
+       modal-cancel → interrupt-running-task → clear-input → hint.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ctrl_c_interrupts_when_busy(self):
+        cancels: list[bool] = []
+        app = OpsBridgeApp(
+            hostname="h", model_label="m",
+            on_operator_turn=lambda _t: None,
+            on_cancel=lambda: cancels.append(True),
+        )
+        async with app.run_test() as pilot:
+            await pilot.press(*list("work"), "enter")
+            await pilot.pause()
+            assert app._in_flight == 1
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+        assert cancels == [True]
+
+    @pytest.mark.asyncio
+    async def test_ctrl_c_clears_input_when_idle(self):
+        """Idle with text in the input → Ctrl-C clears the input.
+        on_cancel must NOT fire (nothing to cancel).
+        """
+        cancels: list[bool] = []
+        app = OpsBridgeApp(
+            hostname="h", model_label="m",
+            on_operator_turn=lambda _t: None,
+            on_cancel=lambda: cancels.append(True),
+        )
+        async with app.run_test() as pilot:
+            inp = app.query_one(WidthAwareInput)
+            inp.value = "draft text"
+            await pilot.pause()
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+            assert inp.value == ""
+        assert cancels == []
+
+    @pytest.mark.asyncio
+    async def test_ctrl_c_idle_empty_input_shows_hint(self):
+        """Idle + empty input → hint, no cancel fired, no exit."""
+        cancels: list[bool] = []
+        written: list[tuple[str, str]] = []
+        app = OpsBridgeApp(
+            hostname="h", model_label="m",
+            on_operator_turn=lambda _t: None,
+            on_cancel=lambda: cancels.append(True),
+        )
+        async with app.run_test() as pilot:
+            _attach_write_top_capture(app, written)
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+        assert cancels == []
+        assert any("Ctrl-D" in l for _k, l in written)
+
+    @pytest.mark.asyncio
+    async def test_ctrl_c_does_not_quit(self):
+        """Ctrl-C must not exit the app, even from idle + empty input."""
+        app = OpsBridgeApp(
+            hostname="h", model_label="m",
+            on_operator_turn=lambda _t: None,
+            on_cancel=lambda: None,
+        )
+        async with app.run_test() as pilot:
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+            # If Ctrl-C exited, run_test() context would have torn down.
+            assert app.is_running is True

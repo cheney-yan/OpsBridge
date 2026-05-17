@@ -990,6 +990,18 @@ class OpsBridgeApp(App):
             pass
 
     async def action_cancel(self) -> None:
+        """Ctrl-C: Claude-Code-style cascade.
+
+        Priority:
+          1. Close any modal overlay (ask form / model picker).
+          2. If the agent / a bash command is running, interrupt it.
+          3. Otherwise (idle), clear the input box if it has text.
+          4. Idle + empty input → hint that Ctrl-D quits.
+
+        Ctrl-D remains the (two-press) quit. Ctrl-C never exits — that
+        matches `bash`, `python`, `claude`, `gemini-cli`, and avoids the
+        finger-memory trap where Ctrl-C kills the session by accident.
+        """
         if self._active_ask is not None:
             self._resolve_ask("__cancelled__")
             return
@@ -997,8 +1009,19 @@ class OpsBridgeApp(App):
             self._close_picker(None)
             self.write_top("[/model] cancelled", kind="system")
             return
-        self._on_cancel()
-        self._do_set_status("idle")
+        if self._in_flight > 0:
+            self._on_cancel()
+            self._do_set_status("idle")
+            return
+        # Idle. Clear any text in the input box.
+        try:
+            inp = self.query_one(Input)
+        except Exception:  # noqa: BLE001
+            return
+        if inp.value:
+            inp.value = ""
+            return
+        self.write_top("[Ctrl-D to quit · /help for commands]", kind="system")
 
     async def action_quit(self) -> None:
         """Ctrl-D handler with two-press confirmation.
