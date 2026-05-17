@@ -37,6 +37,11 @@ set -euo pipefail
 # TTY, and sudo's child pty (under `Defaults use_pty`) wires up correctly to
 # the terminal. Subsequent prompts in bash and Python both work.
 
+# sudoers `Defaults env_reset` strips most env vars by default; `sudo -E`
+# also obeys env_check/env_delete, so OPSBRIDGE_* vars wouldn't make it
+# through. List them explicitly via --preserve-env.
+_OB_ENV_KEEP=OPSBRIDGE_PROVIDER,OPSBRIDGE_MODEL,OPSBRIDGE_BASE_URL,OPSBRIDGE_API_KEY,OPSBRIDGE_JINA_API_KEY,OPSBRIDGE_PUBKEY,OPSBRIDGE_REPO_URL,OPSBRIDGE_REPO_REF,OPSBRIDGE_SRC_DIR,OPSBRIDGE_STDERR,OPSBRIDGE_USE_SYSTEM_PYTHON
+
 if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
     # We were piped. Slurp the rest of stdin and re-exec in one shot.
     _tmp=$(mktemp /tmp/opsbridge-install.XXXXXX.sh)
@@ -55,9 +60,9 @@ if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
         # Not root: re-elevate. sudo invoked from THIS shell (not a pipe),
         # with our TTY as stdin, so sudo's child pty is properly connected.
         if (: </dev/tty) 2>/dev/null; then
-            exec sudo -E bash "$_tmp" "$@" </dev/tty
+            exec sudo --preserve-env="$_OB_ENV_KEEP" bash "$_tmp" "$@" </dev/tty
         else
-            exec sudo -E bash "$_tmp" "$@" </dev/null
+            exec sudo --preserve-env="$_OB_ENV_KEEP" bash "$_tmp" "$@" </dev/null
         fi
     fi
 fi
@@ -66,9 +71,9 @@ fi
 # (i.e., the user invoked `bash install.sh` directly), sudo-elevate now.
 if [[ "$(id -u)" -ne 0 ]]; then
     if (: </dev/tty) 2>/dev/null; then
-        exec sudo -E bash "$0" "$@" </dev/tty
+        exec sudo --preserve-env="$_OB_ENV_KEEP" bash "$0" "$@" </dev/tty
     else
-        exec sudo -E bash "$0" "$@" </dev/null
+        exec sudo --preserve-env="$_OB_ENV_KEEP" bash "$0" "$@" </dev/null
     fi
 fi
 
