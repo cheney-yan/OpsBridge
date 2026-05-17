@@ -581,12 +581,15 @@ def _run_tui_session(
             """
             if bash_tool is None:
                 app.write_top("[!] bash tool not wired in this session")
+                app.notify_turn_done()
                 return
             try:
                 bash_tool.run_direct(cmd)
             except Exception as exc:  # noqa: BLE001
                 app.write_top(f"[! error] {exc}")
                 logger.emit("direct_bash_error", command=cmd, error=str(exc))
+            finally:
+                app.notify_turn_done()
 
         def _apply_model_swap(new_id: str, persist: bool) -> None:
             """Phase-3 §11: swap `bundle.agent.model` to a new LiteLLMModel.
@@ -680,6 +683,7 @@ def _run_tui_session(
                     )
                     app.set_status("idle")
                     app.set_final_answer(f"[error] {exc}")
+                    app.notify_turn_done()
                     if _is_network_error(exc):
                         nonlocal_state["end_reason"] = "network_error"
                         break
@@ -698,6 +702,9 @@ def _run_tui_session(
                     ratio=bundle.budget.ratio,
                 )
                 app.set_status("idle")
+                # §5: release one slot in the queue-depth tracker so the
+                # TUI's pending-counter reflects reality.
+                app.notify_turn_done()
 
                 if not bundle.budget.warned_soft and bundle.budget.ratio >= SOFT_THRESHOLD:
                     app.write_top(f"[context: {pct}% used]")

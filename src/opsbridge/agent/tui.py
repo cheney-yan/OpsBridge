@@ -33,6 +33,54 @@ from textual.containers import Vertical
 from textual.reactive import reactive
 from textual.widgets import Input, RichLog, Static
 
+try:
+    from wcwidth import wcswidth as _wcswidth
+except ImportError:  # pragma: no cover — declared dependency
+    def _wcswidth(s: str) -> int:
+        return len(s)
+
+
+class WidthAwareInput(Input):
+    """Phase 3 §10: Input that forces a full layout refresh on edits.
+
+    textual's default Input widget computes cursor / erase column math
+    assuming each codepoint is column-width 1. That holds for ASCII but
+    not for CJK (wide=2), emoji (wide=2 mostly), or combining sequences.
+    Result: after Backspace on a Chinese character, the right half of
+    the wide glyph stays painted on screen as half-glyph garbage.
+
+    Forcing `refresh(layout=True)` after every edit-action makes the
+    widget recompute its render rectangle, which clears the stale cells.
+    Slightly more expensive than the default but cheap enough for an
+    input line.
+
+    The CJK-typing operator's quality of life is worth more than the few
+    extra repaints per keystroke.
+    """
+
+    def action_delete_left(self) -> None:
+        super().action_delete_left()
+        self.refresh(layout=True)
+
+    def action_delete_left_word(self) -> None:
+        super().action_delete_left_word()
+        self.refresh(layout=True)
+
+    def action_delete_left_all(self) -> None:
+        super().action_delete_left_all()
+        self.refresh(layout=True)
+
+    def action_delete_right(self) -> None:
+        super().action_delete_right()
+        self.refresh(layout=True)
+
+    async def _on_paste(self, event) -> None:  # type: ignore[override]
+        # Pasted CJK runs through the same code path; force a layout
+        # refresh after paste lands so column math comes out right.
+        result = await super()._on_paste(event)
+        self.refresh(layout=True)
+        return result
+
 
 # ---------------------------------------------------------------------------
 # Inter-thread messages
@@ -316,6 +364,11 @@ class OpsBridgeApp(App):
     # Heartbeat tick cadence — drives the elapsed clock visible refresh.
     HEARTBEAT_INTERVAL_SEC = 1.0
 
+    # Phase 3 §5: max number of operator turns pending in the agent
+    # thread's queue. Past this, new submissions are rejected with a
+    # polite message — prevents runaway buildup when the agent is hung.
+    MAX_QUEUE_DEPTH = 5
+
     def __init__(
         self,
         *,
@@ -348,6 +401,9 @@ class OpsBridgeApp(App):
         self._spinner_task: asyncio.Task | None = None
         self._quit_armed_at: float | None = None
         self._state_start_time: float | None = None
+        # §5 queue-depth tracker. Bumped at submit, decremented when the
+        # agent thread reports turn_end via `notify_turn_done`.
+        self._in_flight: int = 0
 
     # ----- composition ----------------------------------------------------
 
@@ -356,7 +412,8 @@ class OpsBridgeApp(App):
             yield TopLog(id="top_log", wrap=True, highlight=False, markup=False)
             yield MiddlePanel(id="middle")
             yield StatusBar(id="status")
-        yield Input(id="prompt", placeholder="ask the agent — /help for commands")
+        # WidthAwareInput (§10) — handles CJK/emoji backspace residue.
+        yield WidthAwareInput(id="prompt", placeholder="ask the agent — /help for commands")
 
     async def on_mount(self) -> None:
         bar = self.query_one(StatusBar)
@@ -479,6 +536,20 @@ class OpsBridgeApp(App):
             self.query_one(StatusBar).ctx_pct = max(0, min(100, int(pct)))
         except Exception:  # noqa: BLE001
             pass
+
+    def notify_turn_done(self) -> None:
+        """Called by the agent thread when a turn (LLM or `!`-direct) ends.
+
+        Decrements the in-flight counter so §5's queue indicator releases.
+        """
+        try:
+            self.call_from_thread(self._do_decrement_queue)
+        except RuntimeError:
+            pass
+
+    def _do_decrement_queue(self) -> None:
+        if self._in_flight > 0:
+            self._in_flight -= 1
 
     # ----- ask form -------------------------------------------------------
 
@@ -643,6 +714,15 @@ class OpsBridgeApp(App):
             self._handle_model_command(stripped[len("/model"):].strip())
             return
 
+        # §5: bound the queue. Past MAX_QUEUE_DEPTH, refuse new turns
+        # with a polite hint pointing to Ctrl-C as the escape.
+        if self._in_flight >= self.MAX_QUEUE_DEPTH:
+            self._do_write_top(
+                f"[queue full — {self._in_flight} pending. "
+                "Press Ctrl-C to cancel the current task before queuing more.]"
+            )
+            return
+
         # `!` prefix → direct bash, skip the LLM (phase-3 §12).
         # `\!` escapes the sigil: treated as plain English.
         if stripped.startswith("\\!"):
@@ -651,13 +731,21 @@ class OpsBridgeApp(App):
             cmd = stripped[1:].strip()
             if not cmd:
                 return
-            self._do_write_top(f"! {cmd}")
+            self._in_flight += 1
+            queue_hint = (
+                f"  (queued — {self._in_flight - 1} ahead)" if self._in_flight > 1 else ""
+            )
+            self._do_write_top(f"! {cmd}{queue_hint}")
             if self._on_direct_bash is not None:
                 self._on_direct_bash(cmd)
             return
 
         # Echo + hand to the agent thread.
-        self._do_write_top(f"> {text}")
+        self._in_flight += 1
+        queue_hint = (
+            f"  (queued — {self._in_flight - 1} ahead)" if self._in_flight > 1 else ""
+        )
+        self._do_write_top(f"> {text}{queue_hint}")
         self._do_set_final_answer("")
         self._do_set_status("thinking")
         self._on_operator_turn(text)

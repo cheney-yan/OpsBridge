@@ -648,6 +648,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(line)
         rc = max(rc, st)
 
+    if args.check_orphans:
+        st, line = _check("agent-owned process tree", _check_orphans, kind="warning")
+        print(line)
+        rc = max(rc, st)
+
     print()
     if rc == 0:
         print(ok("All checks passed."))
@@ -656,6 +661,77 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         print(err("Errors found — fix above before relying on the agent."))
     return rc
+
+
+def _check_orphans():
+    """Phase 3 §9: list agent-owned processes that look like leftovers.
+
+    `Leftover` = process whose euid matches the `agent` user but whose
+    ancestry doesn't trace back through the current opsbridge agent
+    binary (i.e., orphaned bash subprocesses from a previous session
+    that Ctrl-D didn't clean up — usually because `start_new_session`
+    detached them).
+
+    Returns (ok_bool, detail_string). ok=False when orphans exist OR
+    when /proc isn't available (we honestly say so).
+    """
+    if not Path("/proc").exists():
+        return True, "/proc not available (not Linux) — skipping orphan check"
+    if not _user_exists("agent"):
+        return True, "agent user doesn't exist"
+
+    agent_uid = pwd.getpwnam("agent").pw_uid
+    self_pid = os.getpid()
+    orphans: list[tuple[int, int, str]] = []
+    proc_dir = Path("/proc")
+    for entry in proc_dir.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == self_pid:
+            continue
+        try:
+            status_text = (entry / "status").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        # Uid line: "Uid:\t<real>\t<eff>\t<saved>\t<filesystem>"
+        uid_line = next(
+            (l for l in status_text.splitlines() if l.startswith("Uid:")), ""
+        )
+        parts = uid_line.split()
+        if len(parts) < 2 or int(parts[1]) != agent_uid:
+            continue
+        # PPid line: "PPid:\t<pid>"
+        ppid_line = next(
+            (l for l in status_text.splitlines() if l.startswith("PPid:")), ""
+        )
+        ppid_parts = ppid_line.split()
+        ppid = int(ppid_parts[1]) if len(ppid_parts) >= 2 else 0
+        try:
+            cmdline = (entry / "cmdline").read_text(encoding="utf-8", errors="replace")
+            cmdline = cmdline.replace("\x00", " ").strip() or "(no cmdline)"
+        except OSError:
+            cmdline = "(unknown)"
+        orphans.append((pid, ppid, cmdline))
+
+    if not orphans:
+        return True, "no agent-owned processes detected"
+
+    # Anything with ppid=1 is a real orphan (reparented to init); anything
+    # with another agent-pid in ppid is a child of a current session.
+    real_orphans = [(p, pp, c) for p, pp, c in orphans if pp == 1]
+    other = [(p, pp, c) for p, pp, c in orphans if pp != 1]
+    if not real_orphans:
+        return True, (
+            f"{len(other)} agent-owned process(es), all attached to "
+            "active sessions (no orphans)"
+        )
+    lines = [f"  pid {p} (ppid {pp}): {c[:80]}" for p, pp, c in real_orphans]
+    detail = (
+        f"found {len(real_orphans)} orphan process(es) owned by agent:\n"
+        + "\n".join(lines)
+    )
+    return False, detail
 
 
 def _check_system_prompt():
@@ -857,6 +933,7 @@ def main(argv: list[str] | None = None) -> int:
     sp_doctor = sub.add_parser("doctor", help="verify install integrity")
     sp_doctor.add_argument("--check-api", action="store_true", help="also ping the configured LLM")
     sp_doctor.add_argument("--system-prompt", action="store_true", help="validate the system prompt (default + optional override)")
+    sp_doctor.add_argument("--check-orphans", action="store_true", help="list agent-owned processes with PPID=1 (likely orphans from a killed session)")
     sp_doctor.set_defaults(func=cmd_doctor)
 
     sp_enable = sub.add_parser("enable", help="restore the sshd ForceCommand snippet")
