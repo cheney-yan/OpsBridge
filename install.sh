@@ -99,6 +99,32 @@ case "$KERNEL" in
 esac
 log "platform: $PLATFORM"
 
+# --- 1b. ensure sshd is installed (Linux) -------------------------------------
+# Fresh containers (OrbStack, lxc, etc.) frequently ship without
+# openssh-server; the agent's whole reachability story depends on it.
+# Install + enable now, before anything else touches /etc/ssh.
+if [[ "$PLATFORM" == "linux" ]]; then
+    if [[ ! -x /usr/sbin/sshd ]]; then
+        log "installing openssh-server (required for agent SSH access) ..."
+        if command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get update -q
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y openssh-server
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y openssh-server
+        else
+            die "openssh-server is missing and I don't recognize this distro's package manager (no apt/dnf/yum). Install it manually and re-run."
+        fi
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        # Enable + start the service. `ssh` is the unit on Debian/Ubuntu;
+        # `sshd` on Fedora/RHEL. Try both, ignore "not found".
+        systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd 2>/dev/null || \
+            warn "could not enable ssh via systemctl — check manually"
+    fi
+fi
+
 # --- 2. re-run detection ------------------------------------------------------
 ETC=/etc/opsbridge/agent
 EXISTING_INSTALL=0
