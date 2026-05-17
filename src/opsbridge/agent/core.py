@@ -521,7 +521,15 @@ def _run_tui_session(
             turn_queue.put(("!", cmd))
 
         def _on_cancel() -> None:
-            cancel_requested.set()
+            # §3: when bash is currently running, prefer the targeted
+            # subprocess cancel over the broader cancel_requested flag.
+            # The latter only fires at agent-loop iteration boundaries; the
+            # former hits the active process group immediately.
+            cancelled_proc = False
+            if bash_tool is not None and bash_tool.is_running:
+                cancelled_proc = bash_tool.cancel()
+            if not cancelled_proc:
+                cancel_requested.set()
 
         # §11 /model: queued swap. The agent thread applies it between
         # turns; called from the App's input handler on the main thread.

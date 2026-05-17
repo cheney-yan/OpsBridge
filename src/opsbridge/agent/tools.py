@@ -8,13 +8,18 @@ in prompts/system.md. These functions only enforce structural invariants
 from __future__ import annotations
 
 import difflib
+import errno
+import fcntl
 import os
+import pty
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
 from pathlib import Path
@@ -196,11 +201,10 @@ def _stream_lines(
     proc: subprocess.Popen,
     line_sink: Callable[[str], None] | None,
 ) -> str:
-    """Stream proc stdout line-by-line; capture full bytes (sanitized).
+    """Pipe-mode reader: stream proc stdout line-by-line; capture all bytes.
 
-    `line_sink` (if supplied) is called once per full line as it's read.
-    No in-place rolling window — Phase 2 streams every line into the
-    textual top-region log.
+    Kept for the test_track_cwd=False / non-PTY callers that want strictly
+    unaltered subprocess behaviour. Default path is `_stream_lines_pty`.
     """
     captured: list[str] = []
     assert proc.stdout is not None
@@ -224,6 +228,62 @@ def _stream_lines(
     return "".join(captured)
 
 
+def _stream_lines_pty(
+    master_fd: int,
+    line_sink: Callable[[str], None] | None,
+) -> str:
+    """PTY-mode reader (phase-3 §1): read from PTY master until child closes.
+
+    Linux signals child-side close with OSError(EIO); macOS gives an empty
+    read. Both are handled identically as "subprocess is done". Output is
+    normalised so \\r\\n → \\n (PTYs run in canonical mode by default and
+    inject the carriage return on every line).
+    """
+    captured: list[str] = []
+    buf = ""
+    while True:
+        try:
+            chunk = os.read(master_fd, 4096)
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                break
+            raise
+        if not chunk:
+            break
+        text = chunk.decode("utf-8", errors="replace")
+        # PTY canonical-mode artefacts: CRLF → LF. Bare \r (progress-bar
+        # carriage return) is left intact for installers that paint over
+        # the same line; sanitize() strips it as a control byte.
+        text = text.replace("\r\n", "\n")
+        text = sanitize(text)
+        buf += text
+        captured.append(text)
+        if "\n" in buf:
+            parts = buf.split("\n")
+            new_lines, buf = parts[:-1], parts[-1]
+            if line_sink is not None:
+                for line in new_lines:
+                    line_sink(line)
+    if buf and line_sink is not None:
+        line_sink(buf)
+    return "".join(captured)
+
+
+def _set_pty_winsize(fd: int, rows: int = 40, cols: int = 120) -> None:
+    """Tell the child PTY how big the terminal is.
+
+    Default 40×120 — wide enough that progress bars and tabular output
+    (`top`, `htop` if used) don't reflow into garbage. Doesn't need to
+    match the operator's actual terminal because we re-flow output line-
+    by-line into the top region anyway.
+    """
+    try:
+        size = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
+    except OSError:
+        pass
+
+
 def tool_bash(
     command: str,
     timeout_sec: int = DEFAULT_BASH_TIMEOUT,
@@ -232,6 +292,9 @@ def tool_bash(
     cwd: str = DEFAULT_BASH_CWD,
     pre_exec: Callable[[], None] | None = None,
     track_cwd: bool = True,
+    use_pty: bool = True,
+    proc_sink: Callable[[subprocess.Popen], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[str, dict]:
     """Run a shell command via `bash -lc`.
 
@@ -240,14 +303,21 @@ def tool_bash(
     `track_cwd=True` and the command runs to completion — the post-command
     cwd via `meta["cwd"]`).
 
-    `pre_exec` fires *before* the subprocess starts — the caller hooks
-    `bash_pre_exec` audit logging there so the trail survives even if
-    the process is killed mid-run.
+    `pre_exec` fires *before* the subprocess starts. `proc_sink` receives
+    the Popen handle right after spawn so callers (BashTool.cancel)
+    can signal the process group asynchronously.
 
-    `track_cwd` (phase-3 §13): when True, wrap the command with a pwd
-    capture tail so the sticky-cwd indicator can follow `cd` operations
-    across calls. Operators using `!` prefix to chain commands rely on
-    this. Set False for callers that want strictly unaltered execution.
+    `track_cwd` (§13): wrap the command with a pwd-capture tail so the
+    sticky-cwd indicator follows `cd` across calls.
+
+    `use_pty` (§1, default True): give the child a PTY for stdout/stderr.
+    Children using C stdio detect the TTY and stay line-buffered, so
+    install scripts (apt, curl|bash, node setup) stream output in real
+    time instead of arriving in a single 4 KB block at the end.
+
+    `cancel_event`: if set during execution, send SIGTERM to the process
+    group; SIGKILL 2 s later if still running. Returns with the captured
+    output so far plus a `cancelled=True` flag in `meta`.
     """
     if not Path(cwd).exists():
         cwd = os.path.expanduser("~")
@@ -262,35 +332,92 @@ def tool_bash(
 
     started = time.monotonic()
     timed_out = False
+    cancelled = False
+    master_fd: int | None = None
+    slave_fd: int | None = None
 
     try:
-        proc = subprocess.Popen(
-            ["bash", "-lc", effective_cmd],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            cwd=cwd,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-        )
+        if use_pty:
+            master_fd, slave_fd = pty.openpty()
+            _set_pty_winsize(slave_fd)
+            proc = subprocess.Popen(
+                ["bash", "-lc", effective_cmd],
+                stdin=subprocess.DEVNULL,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=cwd,
+                close_fds=True,
+                start_new_session=True,
+            )
+            os.close(slave_fd)
+            slave_fd = None
+        else:
+            proc = subprocess.Popen(
+                ["bash", "-lc", effective_cmd],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                cwd=cwd,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
     except OSError as exc:
+        if master_fd is not None:
+            try: os.close(master_fd)
+            except OSError: pass
+        if slave_fd is not None:
+            try: os.close(slave_fd)
+            except OSError: pass
         return f"[bash error: {exc}]", {"exit": -1, "duration_ms": 0, "timeout": False}
+
+    if proc_sink is not None:
+        try:
+            proc_sink(proc)
+        except Exception:  # noqa: BLE001
+            pass
 
     output_holder: dict[str, str] = {}
 
     def _drain() -> None:
         try:
-            output_holder["data"] = _stream_lines(proc, line_sink)
+            if use_pty and master_fd is not None:
+                output_holder["data"] = _stream_lines_pty(master_fd, line_sink)
+            else:
+                output_holder["data"] = _stream_lines(proc, line_sink)
         except BaseException:  # noqa: BLE001
             pass
 
     t = threading.Thread(target=_drain, daemon=True)
     t.start()
 
-    try:
-        proc.wait(timeout=timeout_sec)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+    # Wait loop — supports timeout AND mid-flight cancellation. Poll the
+    # cancel_event every 200ms while we wait so Ctrl-C feels responsive.
+    deadline = started + timeout_sec
+    poll_interval = 0.2
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            break
+        try:
+            proc.wait(timeout=min(poll_interval, remaining))
+            # Exited. If cancel() signalled us BEFORE the wait returned
+            # (SIGTERM killed the proc instantly), attribute it to cancel
+            # rather than natural exit so the audit log + return marker
+            # reflect what really happened.
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+            break
+        except subprocess.TimeoutExpired:
+            continue
+
+    # Escalation: SIGTERM → wait 2s → SIGKILL → wait 1s.
+    if timed_out or cancelled:
         try:
             os.killpg(proc.pid, signal.SIGTERM)
         except (OSError, ProcessLookupError):
@@ -308,22 +435,30 @@ def tool_bash(
                 pass
 
     t.join(timeout=2)
+
+    if master_fd is not None:
+        try: os.close(master_fd)
+        except OSError: pass
+
     duration_ms = int((time.monotonic() - started) * 1000)
 
     output = output_holder.get("data", "")
 
     # Extract cwd from the wrapped tail BEFORE any timeout suffix is appended.
     captured_cwd: str | None = None
-    if track_cwd and not timed_out:
+    if track_cwd and not (timed_out or cancelled):
         output, captured_cwd = _extract_cwd(output)
 
-    if timed_out:
+    if cancelled:
+        output += "\n[cancelled by operator]"
+    elif timed_out:
         output += f"\n[timeout after {timeout_sec}s]"
 
     meta: dict = {
         "exit": proc.returncode if proc.returncode is not None else -1,
         "duration_ms": duration_ms,
         "timeout": timed_out,
+        "cancelled": cancelled,
     }
     if captured_cwd:
         meta["cwd"] = captured_cwd
@@ -767,10 +902,14 @@ class BashTool(Tool):
         super().__init__()
         self._logger = logger
         self._app = app
-        # Phase 3 §13: sticky cwd. Starts at the install-time default; every
-        # successful bash call updates it from the wrapped pwd capture. The
-        # next call (LLM-routed or `!`-prefix direct) inherits it.
+        # §13: sticky cwd. Starts at the install-time default; every
+        # successful bash call updates it from the wrapped pwd capture.
         self._current_cwd = cwd
+        # §3: operator-cancellation. Set by `cancel()`; the wait loop in
+        # `tool_bash` polls it and SIGTERMs the process group when set.
+        self._cancel_event = threading.Event()
+        self._active_proc: subprocess.Popen | None = None
+        self._proc_lock = threading.Lock()
         if self._app is not None:
             try:
                 self._app.set_cwd(cwd)
@@ -780,6 +919,32 @@ class BashTool(Tool):
     @property
     def current_cwd(self) -> str:
         return self._current_cwd
+
+    @property
+    def is_running(self) -> bool:
+        """True iff a subprocess is currently active (for the cancel wiring)."""
+        with self._proc_lock:
+            return self._active_proc is not None
+
+    def cancel(self) -> bool:
+        """Signal the in-flight subprocess to terminate (phase-3 §3).
+
+        Returns True if a process was signalled, False if no process was
+        active. Safe to call from any thread.
+        """
+        with self._proc_lock:
+            proc = self._active_proc
+        if proc is None or proc.poll() is not None:
+            return False
+        self._cancel_event.set()
+        # The wait loop in tool_bash will pick up the event and run the
+        # SIGTERM→SIGKILL escalation. We also send SIGTERM immediately so
+        # operators don't wait up to poll_interval (~0.2s) for the signal.
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+        return True
 
     def forward(self, command: str, timeout_sec: int = DEFAULT_BASH_TIMEOUT) -> str:
         """smolagents-facing entrypoint. LLM-routed by definition.
@@ -816,13 +981,27 @@ class BashTool(Tool):
                     source=source,
                 )
 
-        result, meta = tool_bash(
-            command,
-            timeout_sec=timeout_sec,
-            line_sink=sink,
-            pre_exec=_pre_exec,
-            cwd=self._current_cwd,
-        )
+        def _proc_sink(proc: subprocess.Popen) -> None:
+            with self._proc_lock:
+                self._active_proc = proc
+
+        # Clear any stale cancel signal from a previous call before starting.
+        self._cancel_event.clear()
+
+        try:
+            result, meta = tool_bash(
+                command,
+                timeout_sec=timeout_sec,
+                line_sink=sink,
+                pre_exec=_pre_exec,
+                cwd=self._current_cwd,
+                proc_sink=_proc_sink,
+                cancel_event=self._cancel_event,
+            )
+        finally:
+            with self._proc_lock:
+                self._active_proc = None
+            self._cancel_event.clear()
 
         # Sticky-cwd update: if the command moved us, follow it.
         new_cwd = meta.get("cwd")
@@ -849,6 +1028,7 @@ class BashTool(Tool):
                 duration_ms=meta["duration_ms"],
                 exit=meta["exit"],
                 timeout=meta["timeout"],
+                cancelled=meta.get("cancelled", False),
                 source=source,
             )
         return result
