@@ -101,10 +101,10 @@ Four tools in two categories — three for IO/execution, one structural.
 
 | Tool | Signature | Purpose |
 |------|-----------|---------|
-| `read` | `read(path: str, offset: int = 0, limit: int = 2000) -> str` | Read a file. Line-numbered output to make subsequent `write` calls easier for the model. |
+| `read` | `read(path: str, offset: int = 0, limit: int = 2000) -> str` | Read a file. Line-numbered output to make subsequent `write` calls easier for the model. Output is ANSI-sanitized (see §5). |
 | `write` | `write(path: str, content: str) -> str` | Write/overwrite a file. Creates parent dirs only if explicitly requested. |
-| `bash` | `bash(command: str, timeout_sec: int = 60) -> str` | Run a shell command via `bash -lc` (login shell — sources `/home/agent/.profile`). Captures full stdout+stderr and returns it to the LLM. To the operator's TUI, streams a **rolling 5-line window** (ANSI cursor control) so long-running output doesn't drown the screen; the final 5 lines remain frozen on-screen when the command exits. Non-TTY fallback: plain append. Default cwd: `/home/agent`. Cannot be interrupted in v1 (see §11). |
-| `remember` | `remember(action: Literal["add", "remove"], content: str) -> str` | The sole sanctioned path for mutating `/etc/opsbridge/agent/preferences.md`. Enforces bullet format, size caps (50 lines / 4 KB), no exact duplicates, no removing nonexistent entries. Emits a structured `preferences_mutation` event to the session JSONL. All judgment — conflict detection, risk assessment, conciseness, pruning — is the LLM's responsibility per system prompt; this function stays dumb. |
+| `bash` | `bash(command: str, timeout_sec: int = 60) -> str` | Run a shell command via `bash -lc` (login shell — sources `/home/agent/.profile`). Captures full stdout+stderr and returns it to the LLM. Output (both live stream and captured return) is ANSI-sanitized (see §5). To the operator's TUI, the live stream renders as a **rolling 5-line window** so long-running output doesn't drown the screen; the final 5 lines remain frozen on-screen when the command exits. Non-TTY fallback: plain append. Default cwd: `/home/agent`. On timeout, the subprocess is killed (SIGTERM then SIGKILL after 2 s) and the captured output so far is returned with a `[timeout after Ns]` suffix. Cannot be interrupted by the operator mid-run in v1 (see §11). |
+| `remember` | `remember(action: Literal["add", "remove"], content: str) -> str` | The sole sanctioned path for mutating `/etc/opsbridge/agent/preferences.md`. Enforces bullet format, size caps (50 lines / 4 KB), no exact duplicates, no removing nonexistent entries. **If the preferences file is missing when `add` is called, the tool creates it via `sudo` (`0640 root:agent`) with an empty stub, then writes the bullet.** `remove` against a missing file is a silent no-op. Emits a structured `preferences_mutation` event to the session JSONL. All judgment — conflict detection, risk assessment, conciseness, pruning — is the LLM's responsibility per system prompt; this function stays dumb. |
 
 No `edit`, no `grep`, no `find` — the model uses `bash` for those.
 `remember` is the **one** structural exception, justified because it is
@@ -166,6 +166,23 @@ the audit chokepoint for preferences.
   confirmation flow (the agent shows the proposed `sudo cp` + `chown`
   command and waits for "yes"). Treat any credential dropped into
   `/home/agent/` as accessible to every authorized key until removed.
+- **Terminal output sanitization:** all tool output destined for the
+  TUI **or** the LLM — `read` return values, `bash`'s captured return,
+  and `bash`'s live byte stream feeding the rolling window — passes
+  through one sanitizer pass:
+  - **Kept:** CSI SGR sequences (`\033[<n>m`) — colors, bold, italic.
+    These render naturally in the operator's terminal and are harmless
+    bytes to the LLM.
+  - **Stripped:** CSI cursor / screen control (`\033[H`, `\033[J`,
+    `\033[K`, `\033[A`–`\033[D`, `\033[?1049h`, …), OSC sequences
+    (`\033]…\007` — terminal title hijacking is the obvious attack),
+    and ESC singles (save/restore cursor, charset switch).
+
+  Rationale: a malicious file content (e.g. `printf '\033]0;OWNED\007'
+  > /tmp/log.txt`) could otherwise change the operator's terminal
+  title, smash the rolling window, or repaint over the agent prompt.
+  A single regex pass keeps the implementation tiny. The same string
+  goes to TUI and LLM — splitting the pipeline buys little for v1.
 
 ## 6. Configuration
 
@@ -268,14 +285,13 @@ into `/usr/local/bin/opsbridge`. All subcommands require root.
 
 | Subcommand | Behavior |
 |------------|----------|
-| `opsbridge install` | Interactive: bootstraps a `uv`-managed Python into `/opt/opsbridge/agent/python/`, creates the `agent` user, installs the project into `/opt/opsbridge/agent/.venv`, writes `/etc/sudoers.d/opsbridge-agent` (NOPASSWD ALL) and `/etc/ssh/sshd_config.d/50-opsbridge-agent.conf`, prompts for provider / model / base_url / API key, reloads sshd. `--skip-model-config` for unattended runs (config later via `opsbridge config`). `--use-system-python` to skip the uv-managed interpreter and rely on `/usr/bin/python3` (requires 3.11+). |
-| `opsbridge upgrade` | Rebuild the venv (re-resolve deps, fetch a newer pinned Python if it moved). Preserves config and preferences. |
+| `opsbridge install` | **Idempotent and update-aware.** On a fresh host: creates the `agent` user, fetches a `uv`-managed Python into `/opt/opsbridge/agent/python/`, builds `/opt/opsbridge/agent/.venv`, writes `/etc/sudoers.d/opsbridge-agent` (NOPASSWD ALL) and `/etc/ssh/sshd_config.d/50-opsbridge-agent.conf`, prompts for provider / model / base_url / API key, reloads sshd. **If already installed:** refreshes the venv (re-resolves deps, fetches a newer pinned Python if the pin moved), restores any missing files (sudoers, sshd snippet, log dir), and leaves existing config / preferences / `authorized_keys` untouched. Pass `--reconfigure` to re-run the LLM prompts as well. `--skip-model-config` for unattended fresh installs. `--use-system-python` to use `/usr/bin/python3` instead of the uv-managed interpreter (requires 3.11+). There is no separate `upgrade` command — re-run `install`. |
 | `opsbridge config` | Re-run the model-configuration prompts only (rotate key, switch provider, change base_url). |
 | `opsbridge doctor` | Verify user state, venv integrity, file paths and permissions, sudoers entry, sshd config syntax, `authorized_keys` presence, log dir writability. `--check-api` additionally pings the configured LLM. Exit `0` ok, `1` error, `2` warning only. |
 | `opsbridge enable` | Restore the sshd `ForceCommand` snippet and reload sshd. |
 | `opsbridge disable` | Move the sshd snippet aside and reload sshd. Existing sessions keep running; new logins refused. |
 | `opsbridge audit preferences` | Print two timelines from `/var/log/opsbridge/agent/*.jsonl`: **canonical** (every `remember` event with diff) and **suspicious** (any `bash` or `write` event whose arguments contain the preferences path). |
-| `opsbridge uninstall` | Remove the `agent` user, `/opt/agent`, `/etc/agent`, `/var/log/agent`, `/etc/sudoers.d/opsbridge-agent`, and the sshd snippet. Asks for explicit confirmation. |
+| `opsbridge uninstall` | Remove the `agent` user, `/opt/opsbridge/`, `/etc/opsbridge/`, `/var/log/opsbridge/`, `/etc/sudoers.d/opsbridge-agent`, and the sshd snippet. Asks for explicit confirmation. |
 
 ## 8. Lifecycle journeys
 
@@ -339,7 +355,7 @@ $ ssh agent@host
 | Review preferences history | `opsbridge audit preferences` |
 | Maintenance window | `opsbridge disable` … `opsbridge enable` |
 | Rotate API key or switch provider | `opsbridge config` |
-| Refresh venv / Python after a release | `opsbridge upgrade` |
+| Refresh venv / Python after a release | `opsbridge install` (idempotent — refreshes deps; config and prefs preserved) |
 | Add operator | append pubkey to `/home/agent/.ssh/authorized_keys` |
 | Revoke operator | remove their pubkey line |
 
@@ -349,9 +365,10 @@ $ ssh agent@host
 sudo opsbridge uninstall
 ```
 
-Removes the `agent` user, `/opt/agent`, `/etc/agent`, `/etc/sudoers.d/opsbridge-agent`,
-the sshd snippet, and `/usr/local/bin/opsbridge`. JSONL logs in
-`/var/log/opsbridge/agent/` are kept for audit; remove them separately if desired.
+Removes the `agent` user, `/opt/opsbridge/`, `/etc/opsbridge/`,
+`/etc/sudoers.d/opsbridge-agent`, the sshd snippet, and
+`/usr/local/bin/opsbridge`. JSONL logs in `/var/log/opsbridge/agent/`
+are kept for audit; remove them separately if desired.
 
 ## 9. Non-goals (v1)
 
@@ -445,8 +462,11 @@ Runtime layout on a host (post-install):
   (`/home/agent/creds/<fp>/`) and bind-mount or symlink the right
   subdir per session. Adds complexity; not worth it until the shared
   blast radius hurts someone.
-- **Rolling-window edge cases.** If a `bash` subprocess emits its own
-  ANSI cursor controls (progress bars, full-screen TUIs like `top`),
-  our 5-line window math will visibly break. v1 documents this — the
-  operator can disconnect and retry with a non-interactive variant
-  (`top -bn1` instead of `top`).
+- **Multi-byte ANSI split across read boundaries.** The output
+  sanitizer (§5) assumes complete escape sequences inside each
+  read-from-pipe chunk. If an escape gets split across a boundary
+  (rare; escape sequences are usually < 20 bytes), the prefix can
+  leak as visible garbage and the suffix as stripped-but-orphaned
+  bytes. Mitigation in code: hold a small carry-over buffer when a
+  chunk ends mid-escape. Listed as a known minor display artifact,
+  not a v1 blocker.
