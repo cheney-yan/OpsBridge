@@ -772,7 +772,261 @@ For the next phase planning:
 | 13 | Current-folder indicator in status bar | medium (operator-requested) |
 | 14 | `/help` slash command | low (discoverability; trivial implementation) |
 | 15 | Drop region dividers, fold header into status bar | **high** (viewport density — 5 rows back on 24-row terminals) |
+| 16 | Claude-Code-style stream UI (replaces §15 layout) | **high** (dogfooding clarity — region-based design read as "form filler" not "chat") |
 
 §1 + §2 + §3 are the "operators don't feel safe" cluster — should be
 the bulk of Phase 3 if there's a Phase 3. §4 is a system-prompt change
 + E2E test; cheap. The rest are nice-to-haves.
+
+---
+
+## 16. Claude-Code-style stream UI (replaces §15 region layout)
+
+### Symptom
+
+§15 cut the chrome borders but kept the four-region mental model
+(top-stream / middle-form / status / input) and distinguished regions
+by background color. Operator dogfooding feedback after deploying §15:
+
+- Even with subtle palette, the per-line background tints (blue for
+  user input, green for AI response, yellow for system notices, etc.)
+  read as "form fields" not "conversation". Eye keeps trying to align
+  things into columns.
+- The middle region's distinct bg is most visible when it's *empty*
+  (collapsed to 0 height but its column-boundary still shows on
+  re-render). It draws the eye to nothing.
+- The "final answer goes to the middle pane" mental model is a relic
+  of the old textual `MiddlePanel` widget — there's no operator-facing
+  reason for the answer to live in a different region than the
+  preceding bash output and tool chatter. They're all part of the same
+  turn.
+- The Phase 2 `_render_form` / `_render_picker` text-string approach
+  hand-rolls layout that textual + rich already do better via real
+  widgets with `border` / `border_title` / `border_subtitle`. Maintaining
+  ASCII-art forms inside a string is a constant source of off-by-one
+  pain (e.g., the picker's pagination footer regularly broke on narrow
+  terminals).
+
+### Reference design
+
+[Elia](https://github.com/darrenburns/elia) — a textual LLM-chat TUI —
+is visually almost-identical to Claude Code and uses ~200 lines of
+widget code where ours uses ~800. The design vocabulary it borrows:
+
+| Element | Textual primitive | What we use today |
+|---|---|---|
+| Message stream | `VerticalScroll` with per-message child widgets | `RichLog` (single buffer, string-style markup) |
+| User / AI message | `Chatbox(Widget)` subclass per role, `render() → Markdown/Syntax` | `write_top(line, kind=…)` with bg-color style |
+| Thinking indicator | `LoadingIndicator` wrapped in a `ResponseStatus(Vertical)` | Custom 1Hz spinner_frame in StatusBar |
+| Prompt input | `TextArea` with `border_title` + `border_subtitle` | `WidthAwareInput` (single-line `Input`) |
+| Confirmation / picker | A `Chatbox`-like widget mounted into the stream, focused, then frozen on resolve | `MiddlePanel` `Static` with hand-rolled ASCII form |
+
+Adopting these primitives both *shrinks our code* (the user-asked-for
+discipline) and *aligns visually* with the tools operators already use
+(Claude Code, gemini-cli).
+
+### Acceptance shape
+
+1. **One scrollable stream.** Replace `TopLog (RichLog) + MiddlePanel`
+   with a single `VerticalScroll` container (id `#stream`). Each agent
+   event mounts a new child widget into `#stream` and scrolls to end.
+   No row-by-row markup; widgets own their own rendering.
+
+2. **Per-role widget classes** (all subclasses of `Static` or `Widget`,
+   in `src/opsbridge/agent/widgets.py`):
+   - `UserMessage` — operator input, `> <text>`. No border. Dim
+     foreground. One-line typically, wraps on long.
+   - `AssistantMessage` — final answer / mid-turn narration. Renders
+     content via `rich.markdown.Markdown` so the model can use lists,
+     code blocks, inline code. No border, normal foreground.
+   - `ToolCallMessage` — `● Bash(npm test)` / `● Read(/etc/foo.toml)`.
+     Compact one-line summary; orange `●` glyph (`#ff8800`).
+   - `ToolResultMessage` — `⎿  <first-N-lines>` block, indented two
+     spaces, dim foreground. Long output gets the rich `Group` of the
+     first N rendered lines plus `… +M more (Ctrl-R to expand)`.
+     Ctrl-R toggles expansion (later phase if heavy).
+   - `BashOutputLine` — raw streamed bash stdout/stderr, ANSI-preserved
+     (we already sanitize CSI/OSC). Indented under the parent
+     `ToolCallMessage`. Truncation rules same as `ToolResultMessage`.
+   - `SystemNotice` — `※ <text>` muted yellow. Used for `/help`,
+     `[queue full]`, `[ime duplicate suppressed]`, etc.
+   - `ErrorMessage` — `● <text>` red. Used for `bash_post_kill`
+     surfacing and tool exceptions.
+
+3. **Inline ask form, inline picker.** Both render into `#stream` as
+   their own child widgets (`AskForm(Widget)` / `ModelPicker(Widget)`),
+   focused on mount, with textual's real `border: round` chrome via
+   TCSS. On resolution: the widget freezes its state and renders a
+   one-line transcript (`※ <prompt> → <choice>`); the form widget
+   stays in the stream as history (not removed). Audit-log invariant
+   ("form-rendered, audit-logged" — CLAUDE.md) is preserved: it's
+   still a structured selectable form, not free-text.
+
+4. **Thinking indicator.** Replace the `StatusBar.spinner_frame`
+   counter with a `ResponseStatus(Vertical)` widget that mounts
+   *inside* `#stream` (always last child while thinking) and contains
+   textual's built-in `LoadingIndicator` + a `Label` showing elapsed
+   seconds. On `notify_turn_done`, the widget is removed from the
+   stream and a `※ done · <elapsed>s` line takes its place. This
+   matches Claude Code's "✻ Thinking… disappears on completion".
+   Status bar no longer carries the spinner.
+
+5. **TextArea input.** Replace `WidthAwareInput` (single-line `Input`)
+   with a `PromptInput(TextArea)` subclass:
+   - `language="markdown"` for free syntax highlight on user input
+   - `border: round` via TCSS for the visual box
+   - `border_title="ask the agent — /help, !cmd, /model"` (chrome
+     replaces the `placeholder=` hack)
+   - `border_subtitle="^j send · ^c clear/cancel · ^d×2 quit"` —
+     dynamically updated per input state (matches elia)
+   - Multi-line: Enter inserts newline; Ctrl+J submits. Resolves the
+     long-standing pain that paste from voice input / long English
+     requests on macOS Terminal eats the trailing chars on a 1-row
+     `Input`.
+   - IME-dedupe state from §10 carries over verbatim (still keyed on
+     submitted text + `Input.Changed`-style flag).
+
+6. **Status bar at the very bottom, single row.** Keep the existing
+   `StatusBar` reactive widget but reorder the screen so it docks at
+   the bottom (below the input). Drop the spinner_frame; keep state /
+   cwd / hostname / model / ctx%.
+
+7. **No region background colors.** Drop the `#0e0e10` / `#18222e` /
+   `#1a1a1c` hex backgrounds from §15. Let textual's `$background` /
+   `$surface` defaults handle base + chrome. Role distinction lives in
+   foreground glyphs (`>`, `●`, `⎿`, `✻`, `※`) + colors (dim / orange /
+   red / yellow). Drops `_TOP_LOG_STYLES` entirely.
+
+### Widget tree (target)
+
+```
+Screen
+├── VerticalScroll #stream  (1fr, fills)
+│   ├── UserMessage          (one per submit)
+│   ├── ToolCallMessage      (one per tool invocation)
+│   │   └── ToolResultMessage / BashOutputLine block …
+│   ├── AssistantMessage     (one per AI final answer)
+│   ├── AskForm              (transient → frozen-as-history on resolve)
+│   ├── ModelPicker          (transient → frozen)
+│   ├── ResponseStatus       (transient — removed on turn end)
+│   ├── SystemNotice / ErrorMessage …
+│   └── … append-only
+├── PromptInput #prompt      (TextArea, height: auto, rounded border)
+└── StatusBar #status        (height: 1, $primary bg)
+```
+
+Compared to §15 widget tree (`Vertical[TopLog + MiddlePanel + StatusBar]`
++ docked `Input`): the per-message widgets are now real DOM nodes, the
+chrome-bearing form widgets replace the rendered-string approach,
+StatusBar moves below the input, and the middle pane vanishes.
+
+### What this deliberately removes from §15
+
+- `MiddlePanel(Static)` class — replaced by inline transient widgets.
+- `TopLog(RichLog)` — replaced by `VerticalScroll` + per-message children.
+- `_TOP_LOG_STYLES` palette dict — role styling moves into the
+  per-role widget's `DEFAULT_CSS` or `render()` method.
+- `_render_form()` / `_render_picker()` string-builders — replaced by
+  the `AskForm.compose()` / `ModelPicker.compose()` widgets.
+- `StatusBar.spinner_frame` reactive — replaced by `LoadingIndicator`
+  inside the `ResponseStatus` widget.
+- `WidthAwareInput(Input)` — replaced by `PromptInput(TextArea)`.
+  The CJK backspace bug it solved is moot: `TextArea` already handles
+  wide chars correctly (textual ships with a proper grapheme cursor).
+
+`set_final_answer()` is removed from `OpsBridgeApp`'s public surface;
+`core.py` now calls `append_assistant(text)` which mounts an
+`AssistantMessage` into `#stream`. `write_top(line, kind=…)` is
+deprecated in favor of a typed surface:
+
+```
+app.append_user(text)
+app.append_tool_call(tool_name, args_summary)
+app.append_tool_result(result_summary)
+app.append_bash_output(line)         # streams under the current ToolCallMessage
+app.append_assistant(markdown_text)
+app.append_system(text)              # ※ notices
+app.append_error(text)               # ● red
+app.begin_thinking() / end_thinking(elapsed_s)
+```
+
+These all dispatch via `call_from_thread` to mount the appropriate
+widget into `#stream` and scroll to end.
+
+### Acceptance tests
+
+Test suite — new file `tests/test_phase3_batch_f.py` (replaces the
+parts of `test_phase3_palette.py` and `test_phase3_batch_a.py` that
+asserted §15 structure):
+
+- `test_stream_is_vertical_scroll` — `#stream` exists, is a
+  `VerticalScroll`, no `MiddlePanel` in the DOM.
+- `test_user_submit_mounts_UserMessage_widget` — submitting "hello"
+  results in exactly one `UserMessage` child in `#stream` with text
+  matching `> hello`.
+- `test_assistant_text_mounts_AssistantMessage` — `append_assistant`
+  mounts an `AssistantMessage` whose `Markdown` renderable carries the
+  payload.
+- `test_tool_call_mounts_ToolCallMessage_with_glyph` — `append_tool_call`
+  results in a `ToolCallMessage` with `● ` prefix and tool-name+args.
+- `test_thinking_widget_appears_and_disappears` — `begin_thinking()`
+  mounts a `ResponseStatus`; `end_thinking()` removes it; after end,
+  there is no `ResponseStatus` in the DOM and a `※ done · …s` line is
+  present.
+- `test_prompt_input_is_textarea_with_rounded_border` — the input is a
+  `TextArea` subclass, has `border_title` set, `language == "markdown"`.
+- `test_ctrl_j_submits_textarea` — Ctrl+J fires `on_operator_turn`;
+  Enter inserts newline; submit empties input.
+- `test_ask_form_mounts_inline` — opening an ask form mounts an
+  `AskForm` widget into `#stream` (not a MiddlePanel update). On
+  resolve, the widget is frozen and a `※ … → yes` transcript line is
+  appended.
+- `test_picker_mounts_inline_and_pages` — opening `/model` mounts a
+  `ModelPicker` into `#stream`; n/p paging updates the widget without
+  re-mounting; pick mounts a `※ /model → <id>` transcript.
+- `test_status_bar_docked_below_input` — DOM order ends with
+  `PromptInput`, then `StatusBar`.
+- Keep all existing IME-dedupe / queue / ctrl-c-cascade tests from
+  Batch E intact — those run against the unchanged
+  `on_input_submitted` / `_in_flight` / `action_cancel` logic.
+
+### Migration notes
+
+- `tests/test_phase3_palette.py` — delete (palette obsolete).
+- `tests/test_phase3_batch_a.py::test_no_header_widget_present` —
+  drop the `MiddlePanel` assertion; replace with `VerticalScroll`
+  and `PromptInput` checks.
+- `tests/test_tui.py::test_render_form*` — delete (`_render_form` is
+  gone). Replace with `tests/test_phase3_batch_f.py::test_ask_form_*`.
+- `tests/test_phase3_batch_b.py` — keep `_PickerState` tests
+  (pagination math survives); drop `_render_picker` tests, replace
+  with `ModelPicker` widget tests that assert the compose tree.
+- `core.py` — replace every `app.write_top(…, kind=…)` with the typed
+  `append_*` surface. Replace `app.set_final_answer(text)` with
+  `app.append_assistant(text)`.
+- `tools.py` — same: bash echo becomes `app.append_tool_call("bash",
+  cmd)` + streaming `append_bash_output(line)`.
+- `prompts/system.md` — no changes (LLM-facing rules unchanged).
+- README screenshot needs re-shoot, but text description stays.
+
+### Why this is one redesign, not five small ones
+
+The §15 region-based code and the per-role-prefix widget code can't
+coexist gracefully: every call site that writes a kind-typed line to
+`RichLog` would need a shim that decides "should this be a child of
+`#stream` or a line of the log?". Doing them together is cleaner:
+one PR replaces the rendering substrate, all callers update once,
+all tests rewrite once. Mid-state would be more code than either
+endpoint.
+
+### What this does NOT change
+
+- Agent thread / asyncio main thread split — unchanged.
+- `call_from_thread` boundary — unchanged.
+- IME dedupe (§10) — moves to `PromptInput.on_changed`, same logic.
+- Queue tracker (`_in_flight`) — unchanged.
+- Ctrl-C cascade (interrupt → clear-input → hint) — unchanged.
+- Audit log fields — unchanged.
+- System prompt anchors — unchanged.
+- Tool surface (read/write/bash/search/visit/ask/remember) — unchanged.
+- `/model` / `/help` / `!` / cwd indicator semantics — unchanged.
