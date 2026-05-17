@@ -215,23 +215,111 @@ prompt_for_config() {
     # Base URL (optional; empty = vendor's official endpoint).
     read -r -p "Custom base URL (empty = official): " base_url
 
-    # API key — required, hidden. Loop until non-empty.
+    # API key — required, hidden. Loop until non-empty. We DO echo a masked
+    # form back after capture so the operator knows the paste worked (silent
+    # hidden input + a separate api.key file is way too easy to misread as
+    # "did it even save?").
     while :; do
-        read -r -s -p "Paste API key (hidden): " api_key
+        read -r -s -p "Paste API key (hidden, will mask back after Enter): " api_key
         echo
-        [[ -n "$api_key" ]] && break
-        echo "  API key cannot be empty" >&2
+        if [[ -z "$api_key" ]]; then
+            echo "  API key cannot be empty" >&2
+            continue
+        fi
+        echo "  captured: $(_mask "$api_key")  → /etc/opsbridge/agent/api.key (mode 0400, owned by agent)"
+        break
     done
 
     # Jina API key — optional, hidden.
     read -r -s -p "Jina API key for 'visit' (empty = skip): " jina_key
     echo
+    if [[ -n "$jina_key" ]]; then
+        echo "  captured: $(_mask "$jina_key")  → /etc/opsbridge/agent/config.toml [visit]"
+    fi
 
     export OPSBRIDGE_PROVIDER="$provider"
     export OPSBRIDGE_MODEL="$model"
     export OPSBRIDGE_BASE_URL="$base_url"
     export OPSBRIDGE_API_KEY="$api_key"
     export OPSBRIDGE_JINA_API_KEY="$jina_key"
+}
+
+# Mask a secret for confirmation echo. Shows `aaaa…zzzz (N chars)` for
+# secrets >8 chars long, `(N chars)` otherwise. Length is informative; the
+# 4-char head/tail lets the operator visually spot a copy/paste truncation.
+_mask() {
+    local s="$1" n=${#1}
+    if (( n > 8 )); then
+        printf '%s…%s (%d chars)' "${s:0:4}" "${s: -4}" "$n"
+    else
+        printf '(%d chars)' "$n"
+    fi
+}
+
+show_config_review() {
+    echo
+    log "Configured (review before applying):"
+    printf '  %-12s : %s\n' "provider" "$OPSBRIDGE_PROVIDER"
+    printf '  %-12s : %s\n' "model"    "$OPSBRIDGE_MODEL"
+    printf '  %-12s : %s\n' "base url" "${OPSBRIDGE_BASE_URL:-(vendor default)}"
+    printf '  %-12s : %s\n' "API key"  "$(_mask "$OPSBRIDGE_API_KEY")"
+    printf '  %-12s : %s\n' "Jina key" "${OPSBRIDGE_JINA_API_KEY:+$(_mask "$OPSBRIDGE_JINA_API_KEY")}${OPSBRIDGE_JINA_API_KEY:-(skipped — 20 RPM unauthenticated)}"
+    printf '  %-12s : %s\n' "pubkey"   "${OPSBRIDGE_PUBKEY:-(skipped — add manually later)}"
+    echo
+}
+
+# Verify the LLM endpoint with a tiny round-trip BEFORE writing config files.
+# Cheaper to catch a bad model/URL/key now than during the operator's first
+# real TUI turn. Honors OPSBRIDGE_SKIP_LLM_CHECK=1 for offline/CI installs.
+check_llm_endpoint() {
+    [[ "${OPSBRIDGE_SKIP_LLM_CHECK:-0}" == "1" ]] && return 0
+
+    local base="$OPSBRIDGE_BASE_URL" provider="$OPSBRIDGE_PROVIDER"
+    local model="$OPSBRIDGE_MODEL" key="$OPSBRIDGE_API_KEY"
+    local body http url
+    body=$(mktemp)
+
+    # When base_url is set, our model.py routes everything via the OpenAI
+    # client (LiteLLM uses "openai/" prefix). So `/chat/completions` works
+    # regardless of which vendor the proxy is fronting.
+    if [[ -n "$base" ]] || [[ "$provider" == "openai" ]]; then
+        url="${base:-https://api.openai.com/v1}"
+        url="${url%/}/chat/completions"
+        log "verifying LLM endpoint: $url (model=$model) ..."
+        http=$(curl -sS -o "$body" -w "%{http_code}" -m 15 \
+            -H "Authorization: Bearer $key" \
+            -H "Content-Type: application/json" \
+            -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"ok\"}],\"max_tokens\":4}" \
+            "$url" 2>/dev/null || echo "000")
+    else
+        # Vendor-native Anthropic: x-api-key header, /v1/messages endpoint.
+        url="https://api.anthropic.com/v1/messages"
+        log "verifying LLM endpoint: $url (model=$model) ..."
+        http=$(curl -sS -o "$body" -w "%{http_code}" -m 15 \
+            -H "x-api-key: $key" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "Content-Type: application/json" \
+            -d "{\"model\":\"$model\",\"max_tokens\":4,\"messages\":[{\"role\":\"user\",\"content\":\"ok\"}]}" \
+            "$url" 2>/dev/null || echo "000")
+    fi
+
+    if [[ "$http" == "200" ]]; then
+        log "  ok (HTTP 200) — endpoint reachable, model recognized"
+        rm -f "$body"
+        return 0
+    fi
+
+    warn "LLM endpoint check failed: HTTP $http"
+    echo "Response body:" >&2
+    head -c 600 "$body" >&2
+    echo >&2
+    echo >&2
+    echo "Common fixes:" >&2
+    echo "  - base URL usually needs the /v1 suffix (e.g. https://your.proxy/v1)" >&2
+    echo "  - verify model name with: curl ${url%/chat/completions}/models -H 'Authorization: Bearer YOUR_KEY' | head" >&2
+    echo "  - confirm API key isn't typo'd or revoked" >&2
+    rm -f "$body"
+    return 1
 }
 
 prompt_for_pubkey() {
@@ -258,8 +346,27 @@ if [[ "$SUPPORTS_TTY" -eq 0 && -z "${OPSBRIDGE_API_KEY:-}" ]]; then
     die "no TTY and no OPSBRIDGE_API_KEY — set env vars (see install.sh header) or run with a TTY"
 fi
 if [[ "$NEEDS_PROMPT" -eq 1 ]]; then
-    prompt_for_config
+    # Interactive: loop on the LLM probe so a wrong model/URL gets fixed
+    # before any /etc files are written.
+    while :; do
+        prompt_for_config
+        show_config_review
+        if check_llm_endpoint; then
+            break
+        fi
+        echo
+        warn "Endpoint didn't accept the config above. Re-enter values, or Ctrl-C to abort."
+        echo
+    done
     prompt_for_pubkey
+elif [[ -n "${OPSBRIDGE_API_KEY:-}" ]]; then
+    # Env-var mode: probe once, surface failure prominently but proceed
+    # (CI / Ansible has no human to re-prompt).
+    show_config_review
+    if ! check_llm_endpoint; then
+        warn "Continuing despite the failed probe (env-var mode). Fix later with:"
+        warn "    sudo opsbridge config && sudo opsbridge doctor --check-api"
+    fi
 fi
 
 # --- 6. opsbridge install -----------------------------------------------------
@@ -274,4 +381,6 @@ log "running: opsbridge install ${ARGS[*]:-(no args)}"
 /usr/local/bin/opsbridge install "${ARGS[@]}"
 
 log "done."
+log "  config + api.key  → /etc/opsbridge/agent/"
+log "  audit logs        → /var/log/opsbridge/agent/"
 log "next: ssh agent@\$(hostname)"
