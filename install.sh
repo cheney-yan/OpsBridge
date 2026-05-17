@@ -296,7 +296,8 @@ prompt_for_model() {
     local provider="$OPSBRIDGE_PROVIDER"
     local models default
 
-    log "discovering models from ${OPSBRIDGE_BASE_URL:-the vendor's default endpoint} ..."
+    local _ep="${OPSBRIDGE_BASE_URL:-the vendor default endpoint}"
+    log "discovering models from $_ep ..."
     models=$(discover_models 2>/dev/null) || true
     if [[ -z "$models" ]]; then
         warn "  couldn't fetch /v1/models — type a model id manually."
