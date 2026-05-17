@@ -1,0 +1,17 @@
+.env
+TEST.local.md
+
+# Claude Code per-user settings
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+dist/
+build/
+
+# OS
+.DS_Store
