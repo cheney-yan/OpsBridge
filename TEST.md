@@ -505,7 +505,7 @@ inside the container:
 
 ```bash
 orb shell -m "$AGENT_TEST_CONTAINER" -- \
-  sudo iptables -A OUTPUT -d $(dig +short cliapi.yan.today | head -1) -j REJECT
+  sudo iptables -A OUTPUT -d "$(dig +short "$(echo "$AGENT_TEST_LLM_BASE_URL" | awk -F/ '{print $3}')" | head -1)" -j REJECT
 ```
 
 Then in the active TUI:
