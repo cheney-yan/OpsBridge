@@ -460,7 +460,11 @@ def _is_network_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
     return any(
         kw in name or kw in msg
-        for kw in ("connection", "network", "timeout", "unreachable", "resolve", "dns")
+        for kw in (
+            "connection", "network", "timeout", "unreachable",
+            "resolve", "dns", "name or service", "errno -2", "errno -3",
+            "no route to host", "refused",
+        )
     )
 
 
