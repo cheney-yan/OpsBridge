@@ -610,6 +610,94 @@ command without updating the help string.
 
 ---
 
+## §15 — TUI layout: drop dividers, consolidate status row
+
+### Acceptance
+
+**T3-15-A1 — No region dividers in the rendered DOM**
+
+Snapshot test (`tests/test_tui_layout.py`, uses `pytest-textual-snapshot`):
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_layout_no_borders` | Boot App, take snapshot | SVG contains no horizontal line characters at region boundaries (no `─` or `═` between top/middle/status/input); region transitions are background-color only |
+| `test_layout_three_distinct_bgs` | Same | Top region, middle region, and status row each render with a different background-color hex value in the SVG output |
+| `test_layout_two_chrome_rows_total` | Set terminal to 24 rows | Combined status+input occupies exactly 2 rows; top+middle fill the remaining 22 |
+
+**T3-15-A2 — Consolidated status row content + truncation**
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_status_row_wide_terminal` | 200 cols | Status row reads `◐ <state> · <elapsed> · <cwd> · @<host> · <model> · ctx <pct>%` — all fields present |
+| `test_status_row_narrow_drops_model_first` | 50 cols | model and @host fields are dropped; spinner/state/elapsed/cwd/ctx still visible |
+| `test_status_row_very_narrow_drops_cwd_to_tilde` | 30 cols | cwd collapses to `~` form; further fields dropped |
+| `test_status_row_idle_omits_elapsed` | state=idle | elapsed field absent (no `· 00:00` clutter when nothing's running) |
+| `test_ctx_color_thresholds` | Set budget.ratio to 0.85 | ctx% field has yellow foreground (Rich markup) |
+| `test_ctx_color_red_threshold` | Set budget.ratio to 0.95 | ctx% field has red foreground |
+
+**T3-15-A3 — Empty middle region collapses to 0 rows**
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_empty_middle_no_height` | Boot, no final answer / no ask form | Top region + middle's box-model height = total content area (middle == 0px) |
+| `test_middle_grows_for_answer` | Set final answer to 5-line text | Middle region grows to 5 rows + padding; top region shrinks accordingly |
+| `test_middle_caps_at_30_percent` | Set final answer to 100-line text | Middle clamps at 30% of screen rows; remainder scrolls within middle |
+| `test_middle_replaced_by_ask_form` | Trigger ask | Middle shows form instead of answer; same band/bg styling |
+
+**T3-15-A4 — Header widget is removed from the tree**
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_no_header_widget` | App tree introspection | `app.query("Header")` returns 0 widgets; the Phase 2 `OpsBridge · host · model · ctx 12%` row is gone |
+| `test_meta_info_in_status` | App with hostname="x", model="y" | StatusBar render contains both "x" and "y" |
+
+**T3-15-A5 — E2E: 24-row terminal density**
+
+In an OrbStack VM, SSH with `stty rows 24`. Pass: visible output rows
+≥ 22 (i.e., top + middle combined when middle is non-empty; top
+alone when middle is empty). Operator can see at least 22 lines of
+scroll history without paging.
+
+### Negative / edge
+
+| Test | Setup | Pass criterion |
+|---|---|---|
+| `test_layout_5_row_terminal` | Extreme: stty rows 5 | App boots; status + input visible; middle collapses; top gets 3 rows. No crash, no truncated mess. |
+| `test_layout_120x80_giant_terminal` | Big terminal | Backgrounds tile correctly; no visual artifacts |
+| `test_layout_resize_to_24_from_60` | Start big, shrink via SIGWINCH | Status row content drops fields gracefully as space shrinks |
+| `test_status_row_handles_long_model_id` | model="claude-sonnet-4-6-20251215-preview" (35 chars) | Truncates to fit or drops earlier fields; never wraps to two rows |
+
+### Cross-cutting integration
+
+This change touches the same surface as §2 (heartbeat) and §13 (cwd
+indicator). Combined tests:
+
+| Test | Pass criterion |
+|---|---|
+| `test_heartbeat_renders_in_consolidated_status_row` | Heartbeat updates land in the new bottom status row, NOT in a removed mid-layout status widget |
+| `test_cwd_indicator_in_status_row` | §13's cwd lives in the same row, between elapsed and @host |
+
+### Regression guards
+
+| File | Test |
+|---|---|
+| `test_tui.py::test_app_constructs` | App still boots cleanly without crashes |
+| `test_tui.py::test_form_renders_options_with_default_marker` | ask form still renders in middle region (now without surrounding borders) |
+| `test_tui.py::test_slash_quit_command_exits` | Slash commands unaffected |
+
+### Snapshot regeneration
+
+Phase 2 snapshot tests (`tests/__snapshots__/test_tui.py.svg`) all
+need to be regenerated since the rendered layout changes substantially.
+Add to §15's PR checklist:
+
+- [ ] Delete old snapshots
+- [ ] Run `pytest --snapshot-update tests/test_tui.py`
+- [ ] Visually inspect new SVGs
+- [ ] Commit new snapshots
+
+---
+
 ## Cross-issue: Phase 2 tests that must still pass
 
 After all of Phase 3 lands, the existing 121-test suite (Phase 1

@@ -649,6 +649,106 @@ Tempting (would let `what can I do?` route via the LLM). But:
 Keep the operator-facing reference structural; let the LLM handle
 "what can the agent do for me" via the existing system prompt.
 
+## 15. TUI layout — drop dividers, fold header into status bar
+
+### Symptom
+
+The current Phase 2 layout renders five distinct rows of chrome around
+two content regions: top border, header row, top-region border,
+middle-region border, status row, input-region border, plus the
+content rows themselves. That's **7 non-content rows** on a typical
+24-row terminal — almost 30% of the viewport.
+
+Operators on small terminals (laptops in tmux splits, mosh sessions on
+phones) lose a lot of usable scroll space to lines that don't carry
+information. The header is also redundant — model name + context %
+rarely change within a session, but they take a permanent row.
+
+### Acceptance shape
+
+Two layout changes:
+
+1. **Drop the dividers.** Distinguish regions by **background color
+   contrast** instead. textual already exposes theme colors
+   (`$surface`, `$boost`, `$panel`). Pick three shades — default for
+   top region, a slightly different bg for middle, and a clearly
+   different bg for the combined status row.
+
+2. **Fold the header into the status bar, place it directly above
+   the input line.** One row carries everything operator-facing:
+
+```
+top region (scrolling output)              ← no border, just bg
+$ apt-get install nginx                    ← cwd shown in status row (§13)
+[search] "nginx install ubuntu" → 5 results
+...
+                                            ← no border
+Will install nginx (~150 MB).              ← middle (final answer), slightly
+Restarts nginx if already running.         ← different bg
+
+◐ thinking · 00:08 · ~/projects · @host · gpt-4.1-mini · ctx 12%
+> install nginx_
+```
+
+Total non-content rows: **2** (status + input). Down from 7. Net gain
+on a 24-row terminal: 5 extra rows of scroll history.
+
+### Consolidated status-row content
+
+Priority left-to-right (most operational first; right truncates
+under width pressure):
+
+```
+◐ <state> · <elapsed> · <cwd> · @<host> · <model> · ctx <%>
+```
+
+| Field | Source | When dropped under width pressure |
+|---|---|---|
+| spinner | textual reactive | never |
+| state | reactive | never |
+| elapsed | §2 heartbeat | absent when state=idle |
+| cwd | §13 sticky tracker | collapses to `~` first |
+| @host | hostname | drops below width=80 |
+| model | agent.model id | drops below width=60 |
+| ctx % | token budget ratio | never (3 chars; cheap) |
+
+`ctx %` switches foreground color: yellow above 80%, red above 90%
+(the existing soft/compress thresholds).
+
+### Region behavior
+
+- **Top region** stays the scrollable log — flex-grow, fills space.
+- **Middle region** holds the latest agent final answer OR an `ask`
+  form (mutually exclusive). Empty middle = 0 height (the input line
+  bumps right up against the top region). Otherwise auto-grows to fit
+  content, capped at 30% of screen. This drops Phase 2's `min-height:
+  2` so the middle doesn't waste rows when there's nothing to show.
+
+### Why background contrast over borders
+
+- **Saves 5 rows** on a 24-row terminal — biggest single win for
+  viewport density in phase-3.
+- **Color is faster to scan** than borders for "where am I in the
+  layout".
+- **Looks modern** — borders read as ncurses/DOS-era; soft background
+  bands read as terminal-native (tmux statusbar, fzf, micro editor).
+- **No information lost** — borders carry zero data; backgrounds
+  carry zero data. Pure visual style swap.
+
+### Migration notes
+
+Pure presentation change. No protocol/audit/system-prompt impact.
+`tui.py` CSS gets rewritten; widget hierarchy + queue/threading model
+unchanged. The Header widget gets deleted; StatusBar absorbs its
+fields. Phase 2 snapshot tests (`pytest-textual-snapshot`) regenerate
+as part of §15's PR.
+
+Cross-cuts cleanly with:
+- §2 heartbeat — same status row, lives at bottom now
+- §13 cwd indicator — already specified to render here
+- §10 CJK backspace — Input-widget-internal, unaffected
+- §11/§12/§14 — input-line behaviors, unaffected
+
 ---
 
 ## Priority
@@ -671,6 +771,7 @@ For the next phase planning:
 | 12 | `!` prefix for direct bash execution | medium (operator-requested) |
 | 13 | Current-folder indicator in status bar | medium (operator-requested) |
 | 14 | `/help` slash command | low (discoverability; trivial implementation) |
+| 15 | Drop region dividers, fold header into status bar | **high** (viewport density — 5 rows back on 24-row terminals) |
 
 §1 + §2 + §3 are the "operators don't feel safe" cluster — should be
 the bulk of Phase 3 if there's a Phase 3. §4 is a system-prompt change
