@@ -28,7 +28,14 @@ from smolagents.monitoring import AgentLogger, LogLevel
 
 from . import tools as t
 from .logging import SessionLogger
-from .model import ModelConfig, build_model, load_config
+from .model import (
+    CONFIG_PATH,
+    ModelConfig,
+    build_model,
+    discover_models,
+    load_config,
+    persist_model_in_config,
+)
 from .prompt_loader import OVERRIDE_PATH, PromptSource, load_system_prompt
 
 # Token budget bands (PRD §3).
@@ -516,12 +523,28 @@ def _run_tui_session(
         def _on_cancel() -> None:
             cancel_requested.set()
 
+        # §11 /model: queued swap. The agent thread applies it between
+        # turns; called from the App's input handler on the main thread.
+        def _on_model_swap(new_id: str, persist: bool) -> None:
+            turn_queue.put(("model_swap", new_id, persist))
+
+        # Memoised model list — discovery hits the network, no need to
+        # repeat every time the operator opens the picker.
+        _models_cache: dict[str, list[str]] = {}
+
+        def _discover_for_picker() -> list[str]:
+            if "list" not in _models_cache:
+                _models_cache["list"] = discover_models(config)
+            return _models_cache["list"]
+
         app = OpsBridgeApp(
             hostname=socket.gethostname(),
             model_label=config.model,
             on_operator_turn=_on_operator_turn,
             on_cancel=_on_cancel,
             on_direct_bash=_on_direct_bash,
+            on_model_swap=_on_model_swap,
+            discover_models=_discover_for_picker,
         )
 
         bundle = _build_agent(
@@ -555,6 +578,43 @@ def _run_tui_session(
                 app.write_top(f"[! error] {exc}")
                 logger.emit("direct_bash_error", command=cmd, error=str(exc))
 
+        def _apply_model_swap(new_id: str, persist: bool) -> None:
+            """Phase-3 §11: swap `bundle.agent.model` to a new LiteLLMModel.
+
+            Queued through turn_queue so it lands between turns — never
+            mid-LLM-call. Persists to config.toml when `persist=True`.
+            """
+            old_id = config.model
+            try:
+                new_cfg = ModelConfig(
+                    provider=config.provider,
+                    model=new_id,
+                    base_url=config.base_url,
+                    api_key=config.api_key,
+                    visit=config.visit,
+                )
+                new_model = build_model(new_cfg)
+            except Exception as exc:  # noqa: BLE001
+                app.write_top(f"[/model error] couldn't build {new_id}: {exc}")
+                logger.emit("model_swap_failed", from_=old_id, to=new_id, error=str(exc))
+                return
+
+            bundle.agent.model = new_model
+            bundle.model = new_model
+            config.model = new_id
+            bundle.budget.window = bundle.budget._lookup_window(new_cfg.model_id)
+            app.set_model(new_id)
+            logger.emit(
+                "model_switch",
+                **{"from": old_id, "to": new_id, "source": "/model save" if persist else "/model"},
+            )
+
+            if persist:
+                if persist_model_in_config(new_id):
+                    app.write_top(f"[/model] persisted {new_id} to {CONFIG_PATH}")
+                else:
+                    app.write_top(f"[/model] swap applied for session; config.toml unchanged (rewrite failed)")
+
         def _agent_loop() -> None:
             while True:
                 msg = turn_queue.get()
@@ -569,6 +629,13 @@ def _run_tui_session(
 
                 if kind == "!":
                     _handle_direct_bash(payload)
+                    continue
+
+                if kind == "model_swap":
+                    # Message shape: ("model_swap", new_id, persist).
+                    new_id = payload
+                    persist = msg[2] if len(msg) > 2 else False
+                    _apply_model_swap(new_id, persist)
                     continue
 
                 # kind == "turn"

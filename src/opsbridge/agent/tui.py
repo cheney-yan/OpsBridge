@@ -177,24 +177,25 @@ def _render_form(state: _AskState) -> str:
 HELP_TEXT = """\
 [help] OpsBridge slash commands
 
-  /model            switch model for this session (picker — phase-3 §11)
-  /model <id>       switch directly to <id>
-  /quit /exit /q    end the session
-  /help /?          show this help
+  /model              open paginated model picker
+  /model <id>         switch directly to <id> (session-only)
+  /model save <id>    switch AND persist to /etc/opsbridge/agent/config.toml
+  /quit /exit /q      end the session
+  /help /?            show this help
 
 Direct exec:
-  !<cmd>            run <cmd> via bash, skipping the LLM
-                    (e.g. !tail -f /var/log/syslog)
-                    audit chain still fires; no ask form.
+  !<cmd>              run <cmd> via bash, skipping the LLM
+                      (e.g. !tail -f /var/log/syslog)
+                      audit chain still fires; no ask form.
 
 Hotkeys:
-  Ctrl-D ×2         quit (first press arms; second within 2s exits)
-  Ctrl-C            cancel current ask form / running bash
+  Ctrl-D ×2           quit (first press arms; second within 2s exits)
+  Ctrl-C              cancel current ask form / running bash
 
 Layout:
-  status row        ◐ state · elapsed · cwd · @host · model · ctx%
-                    fields drop right→left under width pressure.
-                    ctx turns yellow ≥80%, red ≥90%.
+  status row          ◐ state · elapsed · cwd · @host · model · ctx%
+                      fields drop right→left under width pressure.
+                      ctx turns yellow ≥80%, red ≥95%.
 
 Audit log:
   /var/log/opsbridge/agent/<session-id>.jsonl
@@ -202,6 +203,70 @@ Audit log:
 Preferences:
   /etc/opsbridge/agent/preferences.md  (mutate only via `remember`)
 """
+
+
+# ---------------------------------------------------------------------------
+# Model picker — phase-3 §11
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _PickerState:
+    """In-flight model-picker state. Lives in the middle region while open."""
+    models: list[str]
+    selected_idx: int = 0          # index into models[]
+    page: int = 0                  # current page (0-based)
+    page_size: int = 10
+    current_model: str = ""         # to highlight the active one
+
+    @property
+    def total_pages(self) -> int:
+        return max(1, (len(self.models) + self.page_size - 1) // self.page_size)
+
+    def page_slice(self) -> tuple[int, int]:
+        start = self.page * self.page_size
+        end = min(start + self.page_size, len(self.models))
+        return start, end
+
+    def visible(self) -> list[tuple[int, str]]:
+        start, end = self.page_slice()
+        return [(i, self.models[i]) for i in range(start, end)]
+
+    def select_relative(self, delta: int) -> None:
+        n = len(self.models)
+        if n == 0:
+            return
+        self.selected_idx = (self.selected_idx + delta) % n
+        # Keep page in sync with selection.
+        self.page = self.selected_idx // self.page_size
+
+    def page_relative(self, delta: int) -> None:
+        new_page = max(0, min(self.total_pages - 1, self.page + delta))
+        if new_page != self.page:
+            self.page = new_page
+            self.selected_idx = self.page * self.page_size
+
+
+def _render_picker(state: _PickerState) -> str:
+    """Render the picker form for display in the middle region."""
+    lines = ["▶ Switch model (Enter applies, Esc cancels):", ""]
+    if not state.models:
+        lines.append("  (no models discovered — type `/model <id>` to set manually)")
+        return "\n".join(lines)
+    start, _end = state.page_slice()
+    for i, mid in state.visible():
+        marker = "•" if i == state.selected_idx else " "
+        suffix = " ← current" if mid == state.current_model else ""
+        number = i - start + 1   # 1-indexed within the page
+        lines.append(f"  ({marker}) [{number}] {mid}{suffix}")
+    lines.append("")
+    if state.total_pages > 1:
+        lines.append(
+            f"page {state.page + 1}/{state.total_pages}  (n=next, p=prev, "
+            f"1-{min(state.page_size, len(state.models) - start)}=pick, Esc=cancel)"
+        )
+    else:
+        lines.append("(1-9 to pick directly, Enter to apply selection, Esc to cancel)")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +324,8 @@ class OpsBridgeApp(App):
         on_operator_turn: Callable[[str], None],
         on_cancel: Callable[[], None],
         on_direct_bash: Callable[[str], None] | None = None,
+        on_model_swap: Callable[[str, bool], None] | None = None,
+        discover_models: Callable[[], list[str]] | None = None,
         title: str = "OpsBridge",
     ) -> None:
         super().__init__()
@@ -267,10 +334,17 @@ class OpsBridgeApp(App):
         self._on_operator_turn = on_operator_turn
         self._on_cancel = on_cancel
         self._on_direct_bash = on_direct_bash
+        # §11 /model: callback (new_id, persist_to_config) — None disables the
+        # feature (e.g., in unit tests that don't wire an agent).
+        self._on_model_swap = on_model_swap
+        # §11: optional callback that returns the discoverable model list.
+        # Called from the App's input handler; should be fast (cached/synchronous).
+        self._discover_models = discover_models
         # Window title (visible in tmux/terminal title bar). The on-screen
         # equivalent (hostname/model) lives in the consolidated status row.
         self.title = f"{title} · {hostname} · {model_label}"
         self._active_ask: _AskState | None = None
+        self._active_picker: _PickerState | None = None
         self._spinner_task: asyncio.Task | None = None
         self._quit_armed_at: float | None = None
         self._state_start_time: float | None = None
@@ -444,6 +518,10 @@ class OpsBridgeApp(App):
     # ----- key handling for the ask form ----------------------------------
 
     async def on_key(self, event) -> None:
+        # Picker key handling takes precedence when active.
+        if self._active_picker is not None:
+            await self._picker_key(event)
+            return
         if self._active_ask is None:
             return
         state = self._active_ask
@@ -487,6 +565,54 @@ class OpsBridgeApp(App):
         except Exception:  # noqa: BLE001
             pass
 
+    # ----- picker key handling -------------------------------------------
+
+    async def _picker_key(self, event) -> None:
+        state = self._active_picker
+        if state is None:
+            return
+        key = event.key
+        if key == "escape":
+            self._close_picker(None)
+            self._do_write_top("[/model] cancelled")
+            event.stop()
+            return
+        if key == "enter":
+            applied = state.models[state.selected_idx]
+            self._close_picker(applied)
+            event.stop()
+            return
+        if key in ("up",):
+            state.select_relative(-1)
+            self._refresh_picker()
+            event.stop()
+            return
+        if key in ("down",):
+            state.select_relative(1)
+            self._refresh_picker()
+            event.stop()
+            return
+        if key.lower() in ("n",):
+            state.page_relative(1)
+            self._refresh_picker()
+            event.stop()
+            return
+        if key.lower() in ("p",):
+            state.page_relative(-1)
+            self._refresh_picker()
+            event.stop()
+            return
+        # Numeric 1-9 picks within the current page directly.
+        if key.isdigit() and key != "0":
+            idx_in_page = int(key) - 1
+            start, end = state.page_slice()
+            target = start + idx_in_page
+            if target < end:
+                applied = state.models[target]
+                self._close_picker(applied)
+            event.stop()
+            return
+
     # ----- input ----------------------------------------------------------
 
     async def on_input_submitted(self, message: Input.Submitted) -> None:
@@ -508,6 +634,15 @@ class OpsBridgeApp(App):
                 self._do_write_top(line)
             return
 
+        # /model — §11. Three forms:
+        #   /model               → open picker (paginated)
+        #   /model <id>          → swap directly (session-only)
+        #   /model save <id>     → swap AND persist to config.toml
+        if stripped == "/model" or stripped.startswith("/model "):
+            self._do_write_top(f"> {stripped}")
+            self._handle_model_command(stripped[len("/model"):].strip())
+            return
+
         # `!` prefix → direct bash, skip the LLM (phase-3 §12).
         # `\!` escapes the sigil: treated as plain English.
         if stripped.startswith("\\!"):
@@ -527,9 +662,108 @@ class OpsBridgeApp(App):
         self._do_set_status("thinking")
         self._on_operator_turn(text)
 
+    # ----- /model handling (phase-3 §11) ----------------------------------
+
+    def _handle_model_command(self, args: str) -> None:
+        """Dispatch /model parsing.
+
+        args is whatever follows `/model` (empty = open picker; `<id>` =
+        swap; `save <id>` = swap + persist).
+        """
+        if self._on_model_swap is None:
+            self._do_write_top("[/model] not available (no agent wired)")
+            return
+
+        if not args:
+            self._open_model_picker()
+            return
+
+        parts = args.split(maxsplit=1)
+        if parts[0] == "save" and len(parts) == 2:
+            new_id = parts[1].strip()
+            if new_id:
+                self._do_write_top(f"[/model] switching to {new_id} (persist)")
+                self._on_model_swap(new_id, True)
+                self._do_set_model(new_id)
+            return
+
+        # Plain `/model <id>` — session-only swap.
+        new_id = args.strip()
+        if new_id:
+            self._do_write_top(f"[/model] switching to {new_id}")
+            self._on_model_swap(new_id, False)
+            self._do_set_model(new_id)
+
+    def _open_model_picker(self) -> None:
+        """Render the picker into the middle region."""
+        models: list[str] = []
+        if self._discover_models is not None:
+            try:
+                models = self._discover_models() or []
+            except Exception:  # noqa: BLE001
+                models = []
+        if not models:
+            self._do_write_top("[/model] couldn't discover models — type `/model <id>` to set manually")
+            return
+        # Highlight the currently-active model.
+        try:
+            current = self.query_one(StatusBar).model
+        except Exception:  # noqa: BLE001
+            current = self._model_label
+        state = _PickerState(models=models, current_model=current)
+        # Move selection to the current model if it's in the list.
+        for i, m in enumerate(state.models):
+            if m == current:
+                state.selected_idx = i
+                state.page = i // state.page_size
+                break
+        self._active_picker = state
+        self._do_set_status("awaiting input")
+        try:
+            self.query_one(MiddlePanel).update(_render_picker(state))
+            self.query_one(MiddlePanel).display = True
+        except Exception:  # noqa: BLE001
+            pass
+        # Defocus Input so character keys (digits, n, p, Esc) bubble up to
+        # the App-level on_key handler instead of being typed into the
+        # input field.
+        try:
+            self.set_focus(None)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _refresh_picker(self) -> None:
+        if self._active_picker is None:
+            return
+        try:
+            self.query_one(MiddlePanel).update(_render_picker(self._active_picker))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _close_picker(self, applied: str | None = None) -> None:
+        self._active_picker = None
+        try:
+            self.query_one(MiddlePanel).clear()
+        except Exception:  # noqa: BLE001
+            pass
+        self._do_set_status("idle")
+        if applied and self._on_model_swap is not None:
+            self._on_model_swap(applied, False)
+            self._do_set_model(applied)
+            self._do_write_top(f"[/model] switched to {applied}")
+        # Hand focus back to the input line so the operator can keep typing.
+        try:
+            self.query_one(Input).focus()
+        except Exception:  # noqa: BLE001
+            pass
+
     async def action_cancel(self) -> None:
         if self._active_ask is not None:
             self._resolve_ask("__cancelled__")
+            return
+        if self._active_picker is not None:
+            self._close_picker(None)
+            self._do_write_top("[/model] cancelled")
             return
         self._on_cancel()
         self._do_set_status("idle")

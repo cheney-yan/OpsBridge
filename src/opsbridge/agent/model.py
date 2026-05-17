@@ -111,3 +111,66 @@ def build_model(cfg: ModelConfig) -> LiteLLMModel:
     if cfg.base_url:
         kwargs["api_base"] = cfg.base_url
     return LiteLLMModel(**kwargs)
+
+
+def discover_models(cfg: ModelConfig, *, timeout_sec: int = 8) -> list[str]:
+    """Phase 3 §11: fetch the model id list from the configured endpoint.
+
+    Returns one model id per entry. Empty list on any failure — caller
+    falls back to free-text entry.
+    """
+    if not cfg.base_url:
+        # No vendor-native /v1/models we want to depend on. Return a
+        # hardcoded short-list for the common provider; operator can still
+        # type any model id manually.
+        if cfg.provider == "anthropic":
+            return ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7"]
+        return []
+    try:
+        import httpx
+        base = cfg.base_url.rstrip("/")
+        r = httpx.get(
+            f"{base}/models",
+            headers={"Authorization": f"Bearer {cfg.api_key}"},
+            timeout=timeout_sec,
+        )
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("data", data) if isinstance(data, dict) else data
+        ids: list[str] = []
+        for m in items or []:
+            if isinstance(m, dict):
+                mid = m.get("id") or m.get("name")
+                if mid:
+                    ids.append(str(mid))
+            elif isinstance(m, str):
+                ids.append(m)
+        return ids
+    except Exception:  # noqa: BLE001 — discovery failures fall back gracefully
+        return []
+
+
+def persist_model_in_config(new_model_id: str, config_path: Path = CONFIG_PATH) -> bool:
+    """Rewrite the `model = ...` line in config.toml for `/model save`.
+
+    Preserves the rest of the file (comments, other keys, [visit] block)
+    via regex replacement on the raw text. Returns True on success.
+    """
+    if not config_path.exists():
+        return False
+    import re
+    try:
+        text = config_path.read_text(encoding="utf-8")
+        new_text, n = re.subn(
+            r'^(\s*model\s*=\s*)["\'][^"\']*["\']',
+            rf'\1"{new_model_id}"',
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        if n == 0:
+            return False
+        config_path.write_text(new_text, encoding="utf-8")
+        return True
+    except OSError:
+        return False
