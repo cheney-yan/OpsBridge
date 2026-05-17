@@ -130,7 +130,9 @@ class TestStatusBarConsolidation:
 
 @pytest.mark.asyncio
 async def test_no_header_widget_present():
-    """Phase 3 §15: the Header widget is gone from the rendered DOM."""
+    """Phase 3 §15/§16: Header is gone from the DOM; the layout uses a
+    VerticalScroll stream + PromptInput + StatusBar instead.
+    """
     app = OpsBridgeApp(
         hostname="h",
         model_label="m",
@@ -142,9 +144,11 @@ async def test_no_header_widget_present():
         # The Phase 2 layout used textual's Header; phase-3 §15 removes it.
         headers = list(app.query("Header"))
         assert headers == []
-        # Three core regions still present.
-        assert list(app.query("TopLog"))
-        assert list(app.query("MiddlePanel"))
+        # §16 widget tree.
+        from textual.containers import VerticalScroll
+        from opsbridge.agent import widgets as W
+        assert list(app.query(VerticalScroll))
+        assert list(app.query(W.PromptInput))
         assert list(app.query("StatusBar"))
 
 

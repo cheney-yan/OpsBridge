@@ -16,7 +16,7 @@ import respx
 
 from opsbridge.agent import model as M
 from opsbridge.agent.model import ModelConfig, VisitConfig
-from opsbridge.agent.tui import OpsBridgeApp, _PickerState, _render_picker
+from opsbridge.agent.tui import OpsBridgeApp, _PickerState
 
 
 # ---------------------------------------------------------------------------
@@ -151,27 +151,9 @@ class TestPickerState:
 # _render_picker — visible text content
 # ---------------------------------------------------------------------------
 
-class TestRenderPicker:
-    def test_render_marks_selected(self):
-        s = _PickerState(models=["a", "b", "c"], selected_idx=1)
-        text = _render_picker(s)
-        assert any(line.lstrip().startswith("(•)") and "b" in line for line in text.splitlines())
-
-    def test_render_highlights_current_model(self):
-        s = _PickerState(models=["a", "b"], current_model="b")
-        text = _render_picker(s)
-        assert "← current" in text
-
-    def test_render_shows_page_info_when_paginated(self):
-        s = _PickerState(models=[f"m{i}" for i in range(25)], page_size=10)
-        text = _render_picker(s)
-        assert "page 1/3" in text
-        assert "n=next" in text
-
-    def test_render_handles_empty_models(self):
-        s = _PickerState(models=[])
-        text = _render_picker(s)
-        assert "no models discovered" in text
+# (Per PRD-phase3 §16: _render_picker text rendering replaced by the
+# ModelPicker widget. Widget-level assertions live in
+# tests/test_phase3_batch_f.py::test_model_picker_*.)
 
 
 # ---------------------------------------------------------------------------

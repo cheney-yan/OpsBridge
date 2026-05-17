@@ -877,12 +877,15 @@ discipline) and *aligns visually* with the tools operators already use
    - `border: round` via TCSS for the visual box
    - `border_title="ask the agent — /help, !cmd, /model"` (chrome
      replaces the `placeholder=` hack)
-   - `border_subtitle="^j send · ^c clear/cancel · ^d×2 quit"` —
-     dynamically updated per input state (matches elia)
-   - Multi-line: Enter inserts newline; Ctrl+J submits. Resolves the
-     long-standing pain that paste from voice input / long English
-     requests on macOS Terminal eats the trailing chars on a 1-row
-     `Input`.
+   - `border_subtitle="enter send · shift+enter newline · ^c clear/cancel · ^d×2 quit"` —
+     dynamically updated per input state
+   - **Enter submits; Shift+Enter inserts newline.** Matches Slack /
+     Discord / ChatGPT / Claude.ai conventions — finger memory wins
+     over editor-style Ctrl+J. The default `TextArea` binding for
+     Enter is overridden in our `PromptInput` subclass.
+   - Multi-line capability resolves the long-standing pain that paste
+     from voice input / long English requests on macOS Terminal eats
+     trailing chars on a 1-row `Input`.
    - IME-dedupe state from §10 carries over verbatim (still keyed on
      submitted text + `Input.Changed`-style flag).
 
@@ -975,8 +978,9 @@ asserted §15 structure):
   present.
 - `test_prompt_input_is_textarea_with_rounded_border` — the input is a
   `TextArea` subclass, has `border_title` set, `language == "markdown"`.
-- `test_ctrl_j_submits_textarea` — Ctrl+J fires `on_operator_turn`;
-  Enter inserts newline; submit empties input.
+- `test_enter_submits_shift_enter_newlines` — Enter fires
+  `on_operator_turn` and empties the input; Shift+Enter inserts a
+  literal newline without submitting.
 - `test_ask_form_mounts_inline` — opening an ask form mounts an
   `AskForm` widget into `#stream` (not a MiddlePanel update). On
   resolve, the widget is frozen and a `※ … → yes` transcript line is
