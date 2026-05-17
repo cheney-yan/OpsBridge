@@ -3,7 +3,9 @@
 Covers:
   §5  — Queued-turn visibility (TUI in_flight counter + queue-full reject)
   §9  — opsbridge doctor --check-orphans (agent-owned process scan)
-  §10 — Wide-char (CJK / emoji) input via WidthAwareInput
+  §10 — IME / voice-input duplicate-submit dedupe (CJK wide-char input
+        is now handled natively by textual's TextArea-based PromptInput,
+        so the legacy WidthAwareInput tests are gone — §16 redesign).
 """
 from __future__ import annotations
 
@@ -11,7 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from opsbridge.agent.tui import OpsBridgeApp, WidthAwareInput
+from opsbridge.agent.tui import OpsBridgeApp
+from opsbridge.agent.widgets import PromptInput
 from opsbridge import admin
 
 
@@ -19,53 +22,52 @@ from opsbridge import admin
 # §5 — Queue visibility
 # ---------------------------------------------------------------------------
 
-def _attach_write_top_capture(app, written: list[tuple[str, str]]) -> None:
-    """Replace app.write_top with a synchronous list-appending stub."""
-    def capture(line: str, *, kind: str = "bash_out") -> None:
-        written.append((kind, line))
-    app.write_top = capture  # type: ignore[method-assign]
+# Helper: pull plain text from each widget in the stream for assertions.
+def _stream_texts(app) -> list[str]:
+    from opsbridge.agent.widgets import _StreamMessage
+    return [w.render_text() for w in app.query(_StreamMessage)]
 
 
 @pytest.mark.asyncio
 async def test_first_submit_no_queue_hint():
-    written: list[tuple[str, str]] = []
     app = OpsBridgeApp(
         hostname="h", model_label="m",
         on_operator_turn=lambda _t: None,
         on_cancel=lambda: None,
     )
     async with app.run_test() as pilot:
-        _attach_write_top_capture(app, written)
-        await pilot.press(*list("hello"), "enter")
+        inp = app.query_one(PromptInput)
+        inp.text = "hello"
+        await pilot.press("enter")
         await pilot.pause()
-    user_echoes = [line for kind, line in written if kind == "user"]
-    assert any("> hello" in l for l in user_echoes)
-    assert not any("queued" in l for _k, l in written)
+        texts = _stream_texts(app)
+        assert any("> hello" in t for t in texts), texts
+        assert not any("queued" in t for t in texts)
 
 
 @pytest.mark.asyncio
 async def test_second_submit_while_busy_marks_queued():
-    written: list[tuple[str, str]] = []
     app = OpsBridgeApp(
         hostname="h", model_label="m",
         on_operator_turn=lambda _t: None,
         on_cancel=lambda: None,
     )
     async with app.run_test() as pilot:
-        _attach_write_top_capture(app, written)
-        await pilot.press(*list("first"), "enter")
+        inp = app.query_one(PromptInput)
+        inp.text = "first"
+        await pilot.press("enter")
         await pilot.pause()
-        # Don't notify_turn_done — agent is still "busy".
-        await pilot.press(*list("second"), "enter")
+        inp.text = "second"
+        await pilot.press("enter")
         await pilot.pause()
-    second_echo = next(l for _k, l in written if "second" in l)
-    assert "queued" in second_echo
-    assert "1 ahead" in second_echo
+        texts = _stream_texts(app)
+        second = next(t for t in texts if "second" in t)
+        assert "queued" in second
+        assert "1 ahead" in second
 
 
 @pytest.mark.asyncio
 async def test_queue_full_rejection_at_max_depth():
-    written: list[tuple[str, str]] = []
     sent: list[str] = []
     app = OpsBridgeApp(
         hostname="h", model_label="m",
@@ -73,24 +75,30 @@ async def test_queue_full_rejection_at_max_depth():
         on_cancel=lambda: None,
     )
     async with app.run_test() as pilot:
-        _attach_write_top_capture(app, written)
+        inp = app.query_one(PromptInput)
         for i in range(app.MAX_QUEUE_DEPTH):
-            await pilot.press(*list(f"q{i}"), "enter")
+            inp.text = f"q{i}"
+            await pilot.press("enter")
             await pilot.pause()
         # Now in_flight == 5. Next submit must be rejected.
-        await pilot.press(*list("over"), "enter")
+        inp.text = "over"
+        await pilot.press("enter")
         await pilot.pause()
-    assert len(sent) == app.MAX_QUEUE_DEPTH
-    assert "over" not in sent
-    assert any("queue full" in l for _k, l in written)
+        assert len(sent) == app.MAX_QUEUE_DEPTH
+        assert "over" not in sent
+        assert any("queue full" in t for t in _stream_texts(app))
+
+
+def _mk_submitted(text: str) -> PromptInput.Submitted:
+    """Helper — build a PromptInput.Submitted message with the §16 shape."""
+    return PromptInput.Submitted(text=text)
 
 
 @pytest.mark.asyncio
 async def test_ime_duplicate_submit_is_deduped():
-    """Chinese IMEs / voice input on macOS Terminal emit Input.Submitted
-    TWICE for one Enter. Without dedupe, the agent ran the LLM twice and
-    wrote the echo twice to the top region. Within IME_DUPLICATE_WINDOW_SEC,
-    identical-text submits MUST collapse to one delivery.
+    """Chinese IMEs / voice input on macOS Terminal emit Submitted TWICE
+    for one Enter. Without dedupe the agent runs the LLM twice. Within
+    IME_DUPLICATE_WINDOW_SEC, identical-text submits MUST collapse to one.
     """
     sent: list[str] = []
     app = OpsBridgeApp(
@@ -99,26 +107,18 @@ async def test_ime_duplicate_submit_is_deduped():
         on_cancel=lambda: None,
     )
     async with app.run_test() as pilot:
-        inp = app.query_one(WidthAwareInput)
-        # Simulate the IME double-submit: same text submitted twice in <400ms.
-        from textual.widgets._input import Input
-        msg1 = Input.Submitted(inp, "服务器砌了多久了？", None)
-        msg2 = Input.Submitted(inp, "服务器砌了多久了？", None)
-        await app.on_input_submitted(msg1)
-        await app.on_input_submitted(msg2)
+        await app.on_prompt_input_submitted(_mk_submitted("服务器砌了多久了？"))
+        await app.on_prompt_input_submitted(_mk_submitted("服务器砌了多久了？"))
         await pilot.pause()
-    assert sent == ["服务器砌了多久了？"], (
-        f"expected one delivery, got {sent!r}"
-    )
+        assert sent == ["服务器砌了多久了？"], (
+            f"expected one delivery, got {sent!r}"
+        )
 
 
 @pytest.mark.asyncio
 async def test_identical_resubmit_after_window_is_allowed():
-    """A real `same-message-again` gesture must not be deduped.
-
-    Two paths get through the IME guard:
-      1. An Input.Changed event in between (operator typed new content).
-      2. Time-window expires.
+    """A real same-message-again gesture must not be deduped after the
+    time window expires.
     """
     import asyncio as _asyncio
     sent: list[str] = []
@@ -129,21 +129,22 @@ async def test_identical_resubmit_after_window_is_allowed():
     )
     app.IME_DUPLICATE_WINDOW_SEC = 0.05  # shrink for the test
     async with app.run_test() as pilot:
-        inp = app.query_one(WidthAwareInput)
-        from textual.widgets._input import Input
-        await app.on_input_submitted(Input.Submitted(inp, "again", None))
-        await _asyncio.sleep(0.1)   # past the window
-        await app.on_input_submitted(Input.Submitted(inp, "again", None))
+        await app.on_prompt_input_submitted(_mk_submitted("again"))
+        await _asyncio.sleep(0.1)
+        await app.on_prompt_input_submitted(_mk_submitted("again"))
         await pilot.pause()
-    assert sent == ["again", "again"]
+        assert sent == ["again", "again"]
 
 
 @pytest.mark.asyncio
 async def test_resubmit_after_value_change_is_allowed_immediately():
-    """If Input.Changed fires with non-empty value between two same-text
-    submits, the second goes through even WITHIN the dedupe window —
-    because the operator clearly re-composed input.
+    """If a Changed event fires with non-empty value between two same-text
+    submits, the second goes through within the dedupe window — the
+    operator clearly re-composed input.
     """
+    class _Ev:
+        def __init__(self, text):
+            self.value = text
     sent: list[str] = []
     app = OpsBridgeApp(
         hostname="h", model_label="m",
@@ -151,22 +152,22 @@ async def test_resubmit_after_value_change_is_allowed_immediately():
         on_cancel=lambda: None,
     )
     async with app.run_test() as pilot:
-        inp = app.query_one(WidthAwareInput)
-        from textual.widgets._input import Input
-        await app.on_input_submitted(Input.Submitted(inp, "ping", None))
-        # Simulate the operator typing "ping" again.
-        await app.on_input_changed(Input.Changed(inp, "ping", None))
-        await app.on_input_submitted(Input.Submitted(inp, "ping", None))
+        await app.on_prompt_input_submitted(_mk_submitted("ping"))
+        await app.on_input_changed(_Ev("ping"))
+        await app.on_prompt_input_submitted(_mk_submitted("ping"))
         await pilot.pause()
-    assert sent == ["ping", "ping"]
+        assert sent == ["ping", "ping"]
 
 
 @pytest.mark.asyncio
 async def test_clear_value_event_does_not_break_dedupe():
-    """Our `message.input.value = ""` triggers Input.Changed with an empty
-    string. That MUST NOT count as new operator content — otherwise the
-    IME duplicate that arrives just after our clear would slip through.
+    """Our `inp.clear()` triggers a Changed event with an empty value.
+    That MUST NOT count as new operator content — otherwise IME duplicates
+    arriving just after our clear would slip through.
     """
+    class _Ev:
+        def __init__(self, text):
+            self.value = text
     sent: list[str] = []
     app = OpsBridgeApp(
         hostname="h", model_label="m",
@@ -174,15 +175,11 @@ async def test_clear_value_event_does_not_break_dedupe():
         on_cancel=lambda: None,
     )
     async with app.run_test() as pilot:
-        inp = app.query_one(WidthAwareInput)
-        from textual.widgets._input import Input
-        await app.on_input_submitted(Input.Submitted(inp, "echo", None))
-        # Our clear emits this Changed event:
-        await app.on_input_changed(Input.Changed(inp, "", None))
-        # IME's duplicate Submitted arrives:
-        await app.on_input_submitted(Input.Submitted(inp, "echo", None))
+        await app.on_prompt_input_submitted(_mk_submitted("echo"))
+        await app.on_input_changed(_Ev(""))
+        await app.on_prompt_input_submitted(_mk_submitted("echo"))
         await pilot.pause()
-    assert sent == ["echo"]  # second submit was deduped
+        assert sent == ["echo"]
 
 
 @pytest.mark.asyncio
@@ -223,76 +220,25 @@ class TestOrphanCheck:
 
 
 # ---------------------------------------------------------------------------
-# §10 — Wide-character input subclass
+# §10 — CJK input now handled natively by TextArea-based PromptInput.
+# (PRD-phase3 §16: WidthAwareInput retired; TextArea ships with a
+#  proper grapheme cursor and paste handling. Widget-existence test
+#  lives in tests/test_phase3_batch_f.py.)
 # ---------------------------------------------------------------------------
 
-class TestWidthAwareInput:
-    def test_subclass_exists_and_is_an_input(self):
-        from textual.widgets import Input
-        assert issubclass(WidthAwareInput, Input)
-
-    def test_subclass_overrides_delete_actions(self):
-        from textual.widgets import Input
-        for name in (
-            "action_delete_left",
-            "action_delete_left_word",
-            "action_delete_left_all",
-            "action_delete_right",
-        ):
-            assert hasattr(WidthAwareInput, name)
-            assert getattr(WidthAwareInput, name) is not getattr(Input, name)
-
-    @pytest.mark.asyncio
-    async def test_app_uses_width_aware_input(self):
-        app = OpsBridgeApp(
-            hostname="h", model_label="m",
-            on_operator_turn=lambda _t: None,
-            on_cancel=lambda: None,
-        )
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            inputs = list(app.query(WidthAwareInput))
-            assert len(inputs) == 1
-
-    @pytest.mark.asyncio
-    async def test_cjk_input_does_not_crash(self):
-        app = OpsBridgeApp(
-            hostname="h", model_label="m",
-            on_operator_turn=lambda _t: None,
-            on_cancel=lambda: None,
-        )
-        async with app.run_test() as pilot:
-            inp = app.query_one(WidthAwareInput)
-            inp.value = "安装nginx"
-            inp.cursor_position = len(inp.value)
-            await pilot.press("backspace")
-            await pilot.pause()
-            assert inp.value == "安装ngin"
-
-    @pytest.mark.asyncio
-    async def test_paste_event_does_not_await_none(self):
-        """Regression: textual 8.x's Input._on_paste returns None (not a
-        coroutine). Our `await super()._on_paste(...)` therefore raised
-        TypeError on every CJK paste — including macOS voice input which
-        emits Paste events. Fix: inspect-then-await; never crash the input.
-        """
-        from textual.events import Paste
-
-        app = OpsBridgeApp(
-            hostname="h", model_label="m",
-            on_operator_turn=lambda _t: None,
-            on_cancel=lambda: None,
-        )
-        async with app.run_test() as pilot:
-            inp = app.query_one(WidthAwareInput)
-            inp.focus()
-            await pilot.pause()
-            # Simulate a Paste event (what CJK IMEs + voice input emit).
-            await inp._on_paste(Paste(text="服务器砌了多久了？"))
-            await pilot.pause()
-            # Didn't raise = pass. As a bonus check, the pasted text should
-            # have landed in the input value.
-            assert "服务器" in inp.value
+@pytest.mark.asyncio
+async def test_cjk_text_lands_in_prompt_input():
+    """CJK chars can be assigned + read back from the PromptInput."""
+    app = OpsBridgeApp(
+        hostname="h", model_label="m",
+        on_operator_turn=lambda _t: None,
+        on_cancel=lambda: None,
+    )
+    async with app.run_test() as pilot:
+        inp = app.query_one(PromptInput)
+        inp.text = "服务器砌了多久了？"
+        await pilot.pause()
+        assert inp.text == "服务器砌了多久了？"
 
 
 # ---------------------------------------------------------------------------
@@ -332,30 +278,28 @@ class TestCtrlCCascade:
             on_cancel=lambda: cancels.append(True),
         )
         async with app.run_test() as pilot:
-            inp = app.query_one(WidthAwareInput)
-            inp.value = "draft text"
+            inp = app.query_one(PromptInput)
+            inp.text = "draft text"
             await pilot.pause()
             await pilot.press("ctrl+c")
             await pilot.pause()
-            assert inp.value == ""
+            assert inp.text == ""
         assert cancels == []
 
     @pytest.mark.asyncio
     async def test_ctrl_c_idle_empty_input_shows_hint(self):
         """Idle + empty input → hint, no cancel fired, no exit."""
         cancels: list[bool] = []
-        written: list[tuple[str, str]] = []
         app = OpsBridgeApp(
             hostname="h", model_label="m",
             on_operator_turn=lambda _t: None,
             on_cancel=lambda: cancels.append(True),
         )
         async with app.run_test() as pilot:
-            _attach_write_top_capture(app, written)
             await pilot.press("ctrl+c")
             await pilot.pause()
-        assert cancels == []
-        assert any("Ctrl-D" in l for _k, l in written)
+            assert cancels == []
+            assert any("Ctrl-D" in t for t in _stream_texts(app))
 
     @pytest.mark.asyncio
     async def test_ctrl_c_does_not_quit(self):

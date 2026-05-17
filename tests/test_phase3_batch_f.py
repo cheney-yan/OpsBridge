@@ -133,10 +133,10 @@ async def test_submit_mounts_user_message_in_stream():
         inp.text = "hello world"
         await pilot.press("enter")
         await pilot.pause()
-    assert sent == ["hello world"]
-    msgs = list(app.query(W.UserMessage))
-    assert len(msgs) == 1
-    assert "hello world" in msgs[0].text
+        assert sent == ["hello world"]
+        msgs = list(app.query(W.UserMessage))
+        assert len(msgs) == 1
+        assert "hello world" in msgs[0].text
 
 
 @pytest.mark.asyncio
@@ -149,9 +149,9 @@ async def test_append_assistant_mounts_assistant_message():
     async with app.run_test() as pilot:
         app.append_assistant("done — 3 packages installed")
         await pilot.pause()
-    msgs = list(app.query(W.AssistantMessage))
-    assert len(msgs) == 1
-    assert "3 packages" in msgs[0].text
+        msgs = list(app.query(W.AssistantMessage))
+        assert len(msgs) == 1
+        assert "3 packages" in msgs[0].text
 
 
 @pytest.mark.asyncio
@@ -165,10 +165,10 @@ async def test_append_tool_call_then_result_mounts_pair():
         app.append_tool_call("Bash", "ls /etc")
         app.append_tool_result("3 items")
         await pilot.pause()
-    calls = list(app.query(W.ToolCallMessage))
-    results = list(app.query(W.ToolResultMessage))
-    assert len(calls) == 1 and len(results) == 1
-    assert "ls /etc" in calls[0].args_summary
+        calls = list(app.query(W.ToolCallMessage))
+        results = list(app.query(W.ToolResultMessage))
+        assert len(calls) == 1 and len(results) == 1
+        assert "ls /etc" in calls[0].args_summary
 
 
 @pytest.mark.asyncio
@@ -182,8 +182,8 @@ async def test_append_system_and_error_mount():
         app.append_system("queue full")
         app.append_error("boom")
         await pilot.pause()
-    assert list(app.query(W.SystemNotice))
-    assert list(app.query(W.ErrorMessage))
+        assert list(app.query(W.SystemNotice))
+        assert list(app.query(W.ErrorMessage))
 
 
 # ---------------------------------------------------------------------------
@@ -336,15 +336,15 @@ async def test_show_ask_form_mounts_inline_askform_widget():
         await pilot.pause()
         forms = list(app.query(W.AskForm))
         assert len(forms) == 1
-        # Resolve "no" via keyboard navigation.
+        # Resolve "yes" (default selected_idx=0) via Enter.
         await pilot.press("enter")
         await pilot.pause()
         t.join(timeout=2)
-    assert result.get("choice") in ("yes", "no")
-    # After resolve: the form widget stays in stream as frozen history.
-    forms_after = list(app.query(W.AskForm))
-    assert len(forms_after) == 1
-    assert forms_after[0].frozen is True
+        assert result.get("choice") in ("yes", "no")
+        # After resolve: the form widget stays in stream as frozen history.
+        forms_after = list(app.query(W.AskForm))
+        assert len(forms_after) == 1
+        assert forms_after[0].frozen is True
 
 
 # ---------------------------------------------------------------------------
@@ -389,10 +389,10 @@ async def test_model_picker_pick_freezes_widget_and_calls_swap():
         await pilot.pause()
         await pilot.press("2")           # pick "b"
         await pilot.pause()
-    assert swaps == [("b", True)]
-    # Picker frozen and still visible in history.
-    pickers = list(app.query(W.ModelPicker))
-    assert len(pickers) == 1 and pickers[0].frozen is True
+        assert swaps == [("b", True)]
+        # Picker frozen and still visible in history.
+        pickers = list(app.query(W.ModelPicker))
+        assert len(pickers) == 1 and pickers[0].frozen is True
 
 
 # ---------------------------------------------------------------------------

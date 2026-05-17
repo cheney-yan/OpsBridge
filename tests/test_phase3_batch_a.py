@@ -198,8 +198,8 @@ class TestHelpText:
 
 @pytest.mark.asyncio
 async def test_slash_help_routes_to_top_log():
-    """Typing /help adds the help-text lines to the top region."""
-    written: list[tuple[str, str]] = []
+    """Typing /help adds the help-text lines to the stream as SystemNotice widgets."""
+    from opsbridge.agent import widgets as W
 
     app = OpsBridgeApp(
         hostname="h",
@@ -208,21 +208,14 @@ async def test_slash_help_routes_to_top_log():
         on_cancel=lambda: None,
     )
     async with app.run_test() as pilot:
-        # Capture write_top calls (the styled API). Lines + their kind.
-        original = app.write_top
-
-        def capture(line: str, *, kind: str = "bash_out") -> None:
-            written.append((kind, line))
-            # Don't forward to original — avoid the call_from_thread race.
-
-        app.write_top = capture  # type: ignore[method-assign]
-        await pilot.press("/", "h", "e", "l", "p", "enter")
+        inp = app.query_one(W.PromptInput)
+        inp.text = "/help"
+        await pilot.press("enter")
         await pilot.pause()
-    combined = "\n".join(line for _kind, line in written)
-    assert "OpsBridge slash commands" in combined
-    assert "/model" in combined
-    # Help body uses the `system` kind for the Subtle palette.
-    assert any(kind == "system" for kind, _line in written)
+        notices = list(app.query(W.SystemNotice))
+        combined = "\n".join(n.text for n in notices)
+        assert "OpsBridge slash commands" in combined
+        assert "/model" in combined
 
 
 @pytest.mark.asyncio
