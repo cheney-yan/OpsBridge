@@ -41,6 +41,15 @@ class ModelConfig:
     # destructive operations on this host. Setting this is a deliberate
     # weakening of the safety story; document the trade-off when changing.
     confirm_all_sudo: bool = True
+    # Phase 3 follow-up: per-request LLM timeout. smolagents / LiteLLM
+    # default is "wait forever" for the underlying httpx call — when a
+    # proxy hangs (rate-limited, misbehaving model, network partition)
+    # the agent thread blocks indefinitely and the operator's only
+    # escape is Ctrl-D + reconnect. Default 300s (5 min) gives slow
+    # reasoning models (gpt-5.5, claude-opus deep-think) room to think
+    # but still bounds the hang. Operator can raise it via config.toml
+    # if running explicitly slow models locally.
+    llm_request_timeout_sec: int = 300
 
     @property
     def model_id(self) -> str:
@@ -94,6 +103,7 @@ def load_config(
 
     visit = _load_visit_block(data)
     confirm_all_sudo = bool(data.get("confirm_all_sudo", True))
+    llm_timeout = int(data.get("llm_request_timeout_sec", 300) or 300)
 
     return ModelConfig(
         provider=provider,
@@ -102,6 +112,7 @@ def load_config(
         api_key=api_key,
         visit=visit,
         confirm_all_sudo=confirm_all_sudo,
+        llm_request_timeout_sec=llm_timeout,
     )
 
 
@@ -118,6 +129,10 @@ def build_model(cfg: ModelConfig) -> LiteLLMModel:
     kwargs: dict = {"model_id": cfg.model_id, "api_key": cfg.api_key}
     if cfg.base_url:
         kwargs["api_base"] = cfg.base_url
+    # request_timeout flows into litellm.completion's httpx call. Bounds
+    # how long the agent thread waits on a single LLM request before the
+    # call raises and we surface it as a turn_error in the TUI.
+    kwargs["request_timeout"] = cfg.llm_request_timeout_sec
     return LiteLLMModel(**kwargs)
 
 
