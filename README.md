@@ -31,10 +31,15 @@ entry, sshd `ForceCommand` snippet, and prompts for an LLM API key and an
 authorized SSH pubkey.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/main/install.sh | bash
 ```
 
-For unattended installs (CI / Ansible), set env vars instead of prompting:
+> **Note**: no leading `sudo`. The installer handles privilege escalation
+> itself so its `sudo` invocation is connected to your actual terminal —
+> avoiding the broken-pty trap where `curl | sudo bash` silently fails on
+> interactive prompts.
+
+For unattended installs (CI / Ansible), set env vars to skip prompts:
 
 ```bash
 OPSBRIDGE_PROVIDER=openai \

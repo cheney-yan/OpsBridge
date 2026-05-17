@@ -1,44 +1,83 @@
 #!/usr/bin/env bash
 # OpsBridge one-liner installer.
 #
-#   curl -fsSL <repo>/install.sh | sudo bash
+# Recommended (interactive):
+#     curl -fsSL .../install.sh | bash         ← no leading sudo
 #
-# Interactive when /dev/tty is available; env-var driven otherwise:
-#   OPSBRIDGE_PROVIDER=openai \
-#   OPSBRIDGE_MODEL=gpt-4.1-mini \
-#   OPSBRIDGE_API_KEY=... \
-#   OPSBRIDGE_PUBKEY="ssh-ed25519 AAAA... me@host" \
-#   curl -fsSL .../install.sh | sudo bash
+# Non-interactive (CI / Ansible):
+#     OPSBRIDGE_PROVIDER=anthropic \
+#     OPSBRIDGE_MODEL=claude-sonnet-4-6 \
+#     OPSBRIDGE_API_KEY=... \
+#     OPSBRIDGE_PUBKEY="ssh-ed25519 AAAA... me@host" \
+#     curl -fsSL .../install.sh | bash
+#
+# Why no leading sudo: `curl | sudo bash` is fundamentally broken for
+# interactive prompts. sudo's stdin is the curl pipe (not your terminal),
+# so under Ubuntu's `Defaults use_pty` the child pty has no path back to
+# you — `read`, `getpass`, and friends all see EOF or block forever. This
+# script handles sudo internally so its sudo invocation can attach to your
+# REAL TTY.
 #
 # Re-running is safe — choose [k]eep / [r]econfigure / [a]bort on prompt.
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-# Pipe → tmpfile self re-exec
+# Step 0: get the script onto disk + re-exec as root with a real TTY.
 # -----------------------------------------------------------------------------
-# `curl … | sudo bash` makes bash read its OWN script from stdin (fd 0). Any
-# later `read -r` or `exec </dev/tty` to swap fd 0 to the operator's TTY
-# breaks bash's ability to keep reading remaining script bytes — under sudo's
-# default `use_pty` mode the swap fails with EIO and bash exits with:
-#
-#     bash: error reading input file: Input/output error
-#
-# Robust fix: when our $BASH_SOURCE[0] is empty (= we're being read from a
-# pipe), slurp the rest of stdin into a tmpfile and `exec bash <tmpfile>`,
-# attaching the operator's TTY as the new fd 0. From there on `read` works
-# normally and there's no /dev/tty trickery anywhere else in the script.
-# Falls back to /dev/null if no controlling terminal (CI / non-interactive
-# env-var-driven install).
-if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
-    _ob_install_tmp=$(mktemp /tmp/opsbridge-install.XXXXXX.sh)
-    cat > "$_ob_install_tmp"
-    chmod +x "$_ob_install_tmp"
+
+PIPED=0
+[[ -z "${BASH_SOURCE[0]:-}" ]] && PIPED=1
+
+# If we were piped (curl|bash), slurp the rest of stdin into a tmpfile so the
+# script is reachable as a regular file. Bash can then re-exec from the file
+# without further pipe shenanigans.
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+if [[ "$PIPED" -eq 1 ]]; then
+    SCRIPT_PATH=$(mktemp /tmp/opsbridge-install.XXXXXX.sh)
+    cat > "$SCRIPT_PATH"
+    chmod +x "$SCRIPT_PATH"
+fi
+
+# Re-exec under sudo if we're not root yet. We attach /dev/tty as the new
+# stdin so sudo's child pty (if use_pty is on) gets wired to the operator's
+# real terminal. Without this, any read/getpass below would hang on a doomed
+# pty. /dev/null is the CI fallback when no TTY is available.
+if [[ "$(id -u)" -ne 0 ]]; then
     if (: </dev/tty) 2>/dev/null; then
-        exec bash "$_ob_install_tmp" "$@" </dev/tty
+        exec sudo -E bash "$SCRIPT_PATH" "$@" </dev/tty
     else
-        exec bash "$_ob_install_tmp" "$@" </dev/null
+        exec sudo -E bash "$SCRIPT_PATH" "$@" </dev/null
     fi
 fi
+
+# If we were piped AND already root (the legacy `curl | sudo bash` pattern),
+# the pty is doomed — prompts won't work. Refuse early with guidance unless
+# env-var mode covers everything.
+if [[ "$PIPED" -eq 1 && -z "${OPSBRIDGE_API_KEY:-}" ]]; then
+    cat >&2 <<'EOF'
+
+[install] Detected `curl | sudo bash` without OPSBRIDGE_API_KEY env var.
+[install] This pattern can't be interactive — sudo's child pty is detached
+[install] from your terminal. Use one of:
+[install]
+[install]   # Interactive (recommended — sudo handled internally):
+[install]   curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/main/install.sh | bash
+[install]
+[install]   # Or env-var driven:
+[install]   curl -fsSL .../install.sh | sudo \
+[install]     OPSBRIDGE_PROVIDER=anthropic \
+[install]     OPSBRIDGE_MODEL=claude-sonnet-4-6 \
+[install]     OPSBRIDGE_BASE_URL=https://your.proxy/v1 \
+[install]     OPSBRIDGE_API_KEY=your-key \
+[install]     OPSBRIDGE_PUBKEY="ssh-ed25519 AAAA... me@laptop" \
+[install]     bash
+[install]
+EOF
+    exit 1
+fi
+
+# Past this point: root, on disk as $SCRIPT_PATH, stdin attached to TTY
+# (or /dev/null in env-var mode).
 
 REPO_URL="${OPSBRIDGE_REPO_URL:-https://github.com/cheney-yan/OpsBridge.git}"
 REPO_REF="${OPSBRIDGE_REPO_REF:-main}"
@@ -49,10 +88,6 @@ SUPPORTS_TTY=0
 log()   { printf '\033[1;36m[install]\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[install]\033[0m %s\n' "$*" >&2; }
 die()   { printf '\033[1;31m[install]\033[0m %s\n' "$*" >&2; exit 1; }
-
-if [[ "$(id -u)" -ne 0 ]]; then
-    die "must run as root (use sudo). example: curl -fsSL .../install.sh | sudo bash"
-fi
 
 # --- 1. platform detection ----------------------------------------------------
 KERNEL=$(uname -s)
@@ -75,8 +110,6 @@ if [[ "$EXISTING_INSTALL" -eq 1 ]]; then
     log "existing install detected at $ETC/config.toml"
     if [[ "$SUPPORTS_TTY" -eq 1 ]]; then
         printf '  [k]eep config / [r]econfigure / [a]bort? '
-        # /dev/tty may still be unreadable even with stdin TTY in some
-        # nested sudo/container shells — fall back to keep on read failure.
         if ! read -r CHOICE 2>/dev/null; then
             CHOICE="k"
         fi
@@ -121,21 +154,93 @@ fi
 log "bootstrap (uv + venv) ..."
 "$SRC_DIR/bootstrap.sh"
 
-# --- 5. opsbridge install -----------------------------------------------------
+# --- 5. interactive prompts (in bash, not Python) -----------------------------
+# Python's getpass.getpass() re-opens /dev/tty with its own quirks that
+# misbehave in nested sudo+pty contexts. We sidestep all of that by gathering
+# config in bash and feeding `opsbridge install` via env vars (the existing
+# non-interactive code path).
+
+prompt_for_config() {
+    echo
+    log "Configure LLM"
+
+    local provider model base_url api_key jina_key
+
+    # Provider — validate against the supported set.
+    while :; do
+        read -r -p "Provider [anthropic/openai] [anthropic]: " provider
+        provider=${provider:-anthropic}
+        case "$provider" in
+            anthropic|openai) break ;;
+            *) echo "  must be 'openai' or 'anthropic'" >&2 ;;
+        esac
+    done
+
+    # Model — provider-specific defaults.
+    local default_model
+    case "$provider" in
+        openai)    default_model="gpt-4.1-mini" ;;
+        anthropic) default_model="claude-sonnet-4-6" ;;
+    esac
+    read -r -p "Model [$default_model]: " model
+    model=${model:-$default_model}
+
+    # Base URL (optional; empty = vendor's official endpoint).
+    read -r -p "Custom base URL (empty = official): " base_url
+
+    # API key — required, hidden. Loop until non-empty.
+    while :; do
+        read -r -s -p "Paste API key (hidden): " api_key
+        echo
+        [[ -n "$api_key" ]] && break
+        echo "  API key cannot be empty" >&2
+    done
+
+    # Jina API key — optional, hidden.
+    read -r -s -p "Jina API key for 'visit' (empty = skip): " jina_key
+    echo
+
+    export OPSBRIDGE_PROVIDER="$provider"
+    export OPSBRIDGE_MODEL="$model"
+    export OPSBRIDGE_BASE_URL="$base_url"
+    export OPSBRIDGE_API_KEY="$api_key"
+    export OPSBRIDGE_JINA_API_KEY="$jina_key"
+}
+
+prompt_for_pubkey() {
+    [[ -n "${OPSBRIDGE_PUBKEY:-}" ]] && return 0
+    echo
+    log "Authorize an SSH pubkey"
+    echo "Paste the full pubkey line, then press Enter. Empty to skip."
+    local pubkey
+    read -r -p "> " pubkey
+    [[ -n "$pubkey" ]] && export OPSBRIDGE_PUBKEY="$pubkey"
+}
+
+# Skip interactive prompts when re-running with [k]eep, or when env vars
+# already cover the config, or in non-TTY environments.
+NEEDS_PROMPT=1
+if [[ "$EXISTING_INSTALL" -eq 1 && "$CHOICE" =~ ^[kK]$ ]]; then
+    NEEDS_PROMPT=0
+fi
+if [[ -n "${OPSBRIDGE_API_KEY:-}" ]]; then
+    NEEDS_PROMPT=0
+    log "OPSBRIDGE_API_KEY present — non-interactive env-var install"
+fi
+if [[ "$SUPPORTS_TTY" -eq 0 && -z "${OPSBRIDGE_API_KEY:-}" ]]; then
+    die "no TTY and no OPSBRIDGE_API_KEY — set env vars (see install.sh header) or run with a TTY"
+fi
+if [[ "$NEEDS_PROMPT" -eq 1 ]]; then
+    prompt_for_config
+    prompt_for_pubkey
+fi
+
+# --- 6. opsbridge install -----------------------------------------------------
 ARGS=()
 if [[ "$EXISTING_INSTALL" -eq 1 && "$CHOICE" =~ ^[kK]$ ]]; then
     ARGS+=("--skip-model-config")
 elif [[ "$EXISTING_INSTALL" -eq 1 && "$CHOICE" =~ ^[rR]$ ]]; then
     ARGS+=("--reconfigure")
-fi
-
-# Pick interactive vs env-var driven path.
-if [[ -n "${OPSBRIDGE_API_KEY:-}" ]]; then
-    log "OPSBRIDGE_API_KEY present — non-interactive env-var install"
-elif [[ "$SUPPORTS_TTY" -eq 1 ]]; then
-    ARGS+=("--interactive")
-else
-    die "no TTY and no OPSBRIDGE_API_KEY — set env vars (see install.sh header) or run with a TTY"
 fi
 
 log "running: opsbridge install ${ARGS[*]:-(no args)}"
