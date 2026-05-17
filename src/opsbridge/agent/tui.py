@@ -46,12 +46,15 @@ from rich.markup import escape as _rich_escape
 # chatter and system notices. Avoids cognitive load on long sessions.
 
 _TOP_LOG_STYLES: dict[str, str] = {
-    "user":     "on grey15",            # operator input — slight blue-grey tint
-    "ai":       "on color(22)",          # AI response   — slight green tint
-    "bash_cmd": "bold cyan",             # `$ ...` command echo — accent fg
-    "bash_out": "",                       # bash output — base fg, no tinting
-    "tool":     "dim",                    # [search]/[visit]/etc. — muted fg
-    "system":   "yellow",                 # [help]/[queue full]/etc. — warm fg
+    # Backgrounds use explicit hex so the difference shows reliably across
+    # textual's dark themes (the $boost / $surface tokens are too close to
+    # $surface on many of the built-in themes to be visually distinct).
+    "user":     "on #1a2a40",             # user input — desaturated blue tint
+    "ai":       "on #1a3a25",             # AI response — desaturated green tint
+    "bash_cmd": "bold cyan",              # `$ ...` echo — accent fg, no bg
+    "bash_out": "",                        # raw bash output — neutral
+    "tool":     "dim",                     # [search]/[visit] chatter — muted
+    "system":   "yellow",                  # [help]/[queue full]/[ctx …] — warm
 }
 
 try:
@@ -359,16 +362,18 @@ class OpsBridgeApp(App):
 
     CSS = """
     Screen { layout: vertical; }
-    /* No borders anywhere — regions distinguished by background. */
+    /* No borders anywhere — regions distinguished by background. Explicit
+       hex backgrounds because textual's $surface / $boost are too close
+       on many built-in themes to be visually distinct. */
     #top_log {
         height: 1fr;
-        background: $surface;
+        background: #0e0e10;            /* base */
         padding: 0 1;
     }
     #middle {
         height: auto;
         max-height: 30%;
-        background: $boost;
+        background: #18222e;            /* clearly distinct from top */
         padding: 0 1;
         color: $text;
     }
@@ -379,7 +384,7 @@ class OpsBridgeApp(App):
     }
     Input {
         dock: bottom;
-        background: $surface;
+        background: #1a1a1c;            /* slightly lighter than top */
         border: none;
         padding: 0 1;
     }
@@ -401,6 +406,13 @@ class OpsBridgeApp(App):
     # thread's queue. Past this, new submissions are rejected with a
     # polite message — prevents runaway buildup when the agent is hung.
     MAX_QUEUE_DEPTH = 5
+
+    # If the same text is submitted twice within this window, treat the
+    # second one as an IME / voice-input duplicate (see _last_submit_*
+    # comment in __init__). 400ms is enough to absorb the IME's double-
+    # fire but short enough that a real "send the same message again"
+    # operator gesture isn't blocked.
+    IME_DUPLICATE_WINDOW_SEC = 0.4
 
     def __init__(
         self,
@@ -437,6 +449,14 @@ class OpsBridgeApp(App):
         # §5 queue-depth tracker. Bumped at submit, decremented when the
         # agent thread reports turn_end via `notify_turn_done`.
         self._in_flight: int = 0
+        # IME / voice-input debounce: macOS Terminal + Chinese IME (and
+        # some voice-input modes) emit `Input.Submitted` TWICE for a single
+        # Enter — once for "confirm composition", once for "newline". Both
+        # messages carry the same captured value; both fire on_input_submitted.
+        # We dedupe by remembering the last (text, monotonic) pair and
+        # ignoring identical submits within IME_DUPLICATE_WINDOW_SEC.
+        self._last_submit_text: str = ""
+        self._last_submit_at: float = 0.0
 
     # ----- composition ----------------------------------------------------
 
@@ -758,6 +778,22 @@ class OpsBridgeApp(App):
         message.input.value = ""
         if not text.strip():
             return
+
+        # IME / voice-input dedupe. Chinese IMEs on macOS Terminal (and
+        # some voice modes) emit Input.Submitted TWICE for a single Enter:
+        # the second message carries the same captured value because it
+        # was queued before our `message.input.value = ""` ran. We dedupe
+        # by content + time. A real "send this again" gesture takes longer
+        # than IME_DUPLICATE_WINDOW_SEC for a human, so it isn't blocked.
+        now = time.monotonic()
+        if (
+            text == self._last_submit_text
+            and (now - self._last_submit_at) < self.IME_DUPLICATE_WINDOW_SEC
+        ):
+            return
+        self._last_submit_text = text
+        self._last_submit_at = now
+
         # Any keystroke past the arm window disarms quit.
         self._quit_armed_at = None
 

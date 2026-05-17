@@ -86,6 +86,56 @@ async def test_queue_full_rejection_at_max_depth():
 
 
 @pytest.mark.asyncio
+async def test_ime_duplicate_submit_is_deduped():
+    """Chinese IMEs / voice input on macOS Terminal emit Input.Submitted
+    TWICE for one Enter. Without dedupe, the agent ran the LLM twice and
+    wrote the echo twice to the top region. Within IME_DUPLICATE_WINDOW_SEC,
+    identical-text submits MUST collapse to one delivery.
+    """
+    sent: list[str] = []
+    app = OpsBridgeApp(
+        hostname="h", model_label="m",
+        on_operator_turn=lambda t: sent.append(t),
+        on_cancel=lambda: None,
+    )
+    async with app.run_test() as pilot:
+        inp = app.query_one(WidthAwareInput)
+        # Simulate the IME double-submit: same text submitted twice in <400ms.
+        from textual.widgets._input import Input
+        msg1 = Input.Submitted(inp, "服务器砌了多久了？", None)
+        msg2 = Input.Submitted(inp, "服务器砌了多久了？", None)
+        await app.on_input_submitted(msg1)
+        await app.on_input_submitted(msg2)
+        await pilot.pause()
+    assert sent == ["服务器砌了多久了？"], (
+        f"expected one delivery, got {sent!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_identical_resubmit_after_window_is_allowed():
+    """A real `same-message-again` gesture (after IME_DUPLICATE_WINDOW_SEC)
+    must NOT be deduped — that would silently swallow operator intent."""
+    import asyncio as _asyncio
+    sent: list[str] = []
+    app = OpsBridgeApp(
+        hostname="h", model_label="m",
+        on_operator_turn=lambda t: sent.append(t),
+        on_cancel=lambda: None,
+    )
+    # Shrink the window for the test.
+    app.IME_DUPLICATE_WINDOW_SEC = 0.05
+    async with app.run_test() as pilot:
+        inp = app.query_one(WidthAwareInput)
+        from textual.widgets._input import Input
+        await app.on_input_submitted(Input.Submitted(inp, "again", None))
+        await _asyncio.sleep(0.1)
+        await app.on_input_submitted(Input.Submitted(inp, "again", None))
+        await pilot.pause()
+    assert sent == ["again", "again"]
+
+
+@pytest.mark.asyncio
 async def test_notify_turn_done_releases_one_slot():
     app = OpsBridgeApp(
         hostname="h", model_label="m",
