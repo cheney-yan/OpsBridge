@@ -168,3 +168,28 @@ class TestWidthAwareInput:
             await pilot.press("backspace")
             await pilot.pause()
             assert inp.value == "安装ngin"
+
+    @pytest.mark.asyncio
+    async def test_paste_event_does_not_await_none(self):
+        """Regression: textual 8.x's Input._on_paste returns None (not a
+        coroutine). Our `await super()._on_paste(...)` therefore raised
+        TypeError on every CJK paste — including macOS voice input which
+        emits Paste events. Fix: inspect-then-await; never crash the input.
+        """
+        from textual.events import Paste
+
+        app = OpsBridgeApp(
+            hostname="h", model_label="m",
+            on_operator_turn=lambda _t: None,
+            on_cancel=lambda: None,
+        )
+        async with app.run_test() as pilot:
+            inp = app.query_one(WidthAwareInput)
+            inp.focus()
+            await pilot.pause()
+            # Simulate a Paste event (what CJK IMEs + voice input emit).
+            await inp._on_paste(Paste(text="服务器砌了多久了？"))
+            await pilot.pause()
+            # Didn't raise = pass. As a bonus check, the pasted text should
+            # have landed in the input value.
+            assert "服务器" in inp.value

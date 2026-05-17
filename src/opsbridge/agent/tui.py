@@ -96,11 +96,23 @@ class WidthAwareInput(Input):
         self.refresh(layout=True)
 
     async def _on_paste(self, event) -> None:  # type: ignore[override]
-        # Pasted CJK runs through the same code path; force a layout
-        # refresh after paste lands so column math comes out right.
-        result = await super()._on_paste(event)
+        """Force a layout refresh after a paste lands, so CJK column math
+        comes out right (IMEs and voice-input on macOS/Linux all emit
+        Paste events).
+
+        textual 8.x's `Input._on_paste` is NOT a coroutine — calling it
+        returns None, so `await super()._on_paste(...)` raises TypeError.
+        Newer textual versions may make it async; we inspect-then-await
+        defensively so the override survives both shapes.
+        """
+        import inspect
+        try:
+            result = super()._on_paste(event)
+            if inspect.iscoroutine(result):
+                await result
+        except Exception:  # noqa: BLE001 — never let our refresh wrapper take down the input
+            pass
         self.refresh(layout=True)
-        return result
 
 
 # ---------------------------------------------------------------------------
