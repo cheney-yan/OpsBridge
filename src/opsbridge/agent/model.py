@@ -35,6 +35,12 @@ class ModelConfig:
     base_url: str
     api_key: str
     visit: VisitConfig = field(default_factory=VisitConfig)
+    # Phase 3 §7: per-host opt-out of the soft "ask before sudo" rule.
+    # Default True (keep the chokepoint). When False, the system prompt
+    # tells the LLM the operator has opted into auto-sudo for non-
+    # destructive operations on this host. Setting this is a deliberate
+    # weakening of the safety story; document the trade-off when changing.
+    confirm_all_sudo: bool = True
 
     @property
     def model_id(self) -> str:
@@ -87,6 +93,7 @@ def load_config(
         raise ValueError(f"{api_key_path}: API key file is empty")
 
     visit = _load_visit_block(data)
+    confirm_all_sudo = bool(data.get("confirm_all_sudo", True))
 
     return ModelConfig(
         provider=provider,
@@ -94,6 +101,7 @@ def load_config(
         base_url=base_url,
         api_key=api_key,
         visit=visit,
+        confirm_all_sudo=confirm_all_sudo,
     )
 
 

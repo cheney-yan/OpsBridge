@@ -1020,6 +1020,23 @@ class BashTool(Tool):
                 pass
 
         if self._logger:
+            # §6: bash_post_kill captures the "this command died, here's
+            # the recovery context" snapshot whenever the subprocess was
+            # killed (timeout OR operator cancel). Mirrors bash_pre_exec
+            # so audit consumers can correlate intent (pre) with outcome
+            # (kill). Includes the last ~30 lines of captured output for
+            # post-mortem reading without re-pulling the (truncated)
+            # tool_call result.
+            if meta.get("timeout") or meta.get("cancelled"):
+                tail_lines = result.splitlines()[-30:]
+                self._logger.emit(
+                    "bash_post_kill",
+                    command=command,
+                    signal="SIGTERM",   # we always lead with TERM
+                    reason="timeout" if meta.get("timeout") else "cancelled",
+                    duration_ms=meta["duration_ms"],
+                    output_tail="\n".join(tail_lines),
+                )
             self._logger.emit(
                 "tool_call",
                 tool="bash",

@@ -73,6 +73,7 @@ def load_system_prompt(
     hostname: str | None = None,
     fingerprint: str = "unknown",
     override_path: Path = OVERRIDE_PATH,
+    confirm_all_sudo: bool = True,
 ) -> PromptSource:
     """Build the system prompt for this session.
 
@@ -110,6 +111,23 @@ def load_system_prompt(
         fingerprint=fingerprint,
         preferences_block=_format_preferences_block(prefs_path),
     )
+    # Phase 3 §7: append the per-host sudo-relaxation clause when the
+    # operator has explicitly opted in via config.toml. The hard rules
+    # stay unchanged — we just add context the LLM can balance against.
+    if not confirm_all_sudo:
+        substituted = substituted.rstrip() + "\n\n" + (
+            "## Per-host sudo relaxation (opt-in)\n\n"
+            "This host has `confirm_all_sudo = false` set in "
+            "`/etc/opsbridge/agent/config.toml`. The operator has explicitly "
+            "opted into auto-sudo for **non-destructive** read-only commands "
+            "(`sudo journalctl`, `sudo cat /var/log/...`, `sudo systemctl "
+            "status`, `sudo ls /root`, etc.) — you may run those without "
+            "asking. **The Hard rules above still apply for destructive "
+            "operations.** A destructive sudo (any `rm`, package install/"
+            "remove, service restart/start/stop, firewall change, file "
+            "truncate/append outside `/tmp`, kill not-your-process) still "
+            "requires `ask` first. When unsure, ask.\n"
+        )
     digest = hashlib.sha256(substituted.encode("utf-8")).hexdigest()
 
     return PromptSource(

@@ -214,6 +214,7 @@ def _build_agent(
     prompt = load_system_prompt(
         prefs_path,
         fingerprint=_ssh_key_fingerprint(),
+        confirm_all_sudo=getattr(config, "confirm_all_sudo", True),
     )
     logger.emit(
         "system_prompt_source",
@@ -505,6 +506,7 @@ def _run_tui_session(
             model=config.model,
             base_url=config.base_url,
             hostname=socket.gethostname(),
+            confirm_all_sudo=getattr(config, "confirm_all_sudo", True),
         )
 
         # Inter-thread plumbing. Operator messages are typed:
