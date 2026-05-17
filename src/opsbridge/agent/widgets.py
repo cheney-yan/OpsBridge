@@ -63,10 +63,20 @@ class _StreamMessage(Static):
 
 
 class UserMessage(_StreamMessage):
-    """`> <text>` — operator input echoed into the stream."""
+    """`> <text>` — operator input echoed into the stream.
+
+    Visual anchor: full-row dim background so the eye can locate each
+    operator turn when scrolling back through history.
+    """
 
     DEFAULT_CSS = """
-    UserMessage { color: $text-muted; }
+    UserMessage {
+        background: #1f2733;
+        color: $text;
+        padding: 0 1;
+        margin: 1 0 0 0;
+        text-style: bold;
+    }
     """
 
     def render_text(self) -> str:
