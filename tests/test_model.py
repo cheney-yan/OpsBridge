@@ -46,6 +46,18 @@ def test_load_config_empty_key(tmp_path):
         model.load_config(cfg_path, key_path)
 
 
+def test_load_config_anthropic_via_proxy_routes_as_openai(tmp_path):
+    """Anthropic-tagged config with a base_url is served by an OpenAI-compatible proxy,
+    so the resulting model_id must use the `openai/` prefix so LiteLLM picks the right client."""
+    cfg_path = tmp_path / "config.toml"
+    key_path = tmp_path / "api.key"
+    cfg_path.write_text('provider = "anthropic"\nmodel = "claude-haiku-4-5"\nbase_url = "https://proxy.example/v1"\n')
+    key_path.write_text("k\n")
+    cfg = model.load_config(cfg_path, key_path)
+    assert cfg.provider == "anthropic"
+    assert cfg.model_id == "openai/claude-haiku-4-5"
+
+
 def test_load_config_already_prefixed_model(tmp_path):
     cfg_path = tmp_path / "config.toml"
     key_path = tmp_path / "api.key"

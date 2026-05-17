@@ -17,11 +17,28 @@ import textwrap
 from pathlib import Path
 from typing import Callable
 
+import io as _io
 from smolagents import CodeAgent
+from smolagents.monitoring import AgentLogger, LogLevel
 
 from . import tools as t
 from .logging import SessionLogger
 from .model import ModelConfig, build_model, load_config
+
+
+def _build_quiet_logger() -> AgentLogger:
+    """A smolagents AgentLogger that swallows all output.
+
+    smolagents prints "Error in code parsing" and related noise via Rich
+    Console.print → stdout. We don't want any of that scrolling past the
+    operator. Building a Console pointed at /dev/null keeps it bottled.
+    """
+    try:
+        from rich.console import Console
+        quiet = Console(file=_io.StringIO(), highlight=False, force_terminal=False)
+        return AgentLogger(level=LogLevel.ERROR, console=quiet)
+    except ImportError:
+        return AgentLogger(level=LogLevel.ERROR)
 
 # Token budget bands (PRD §3).
 SOFT_THRESHOLD = 0.80
@@ -327,6 +344,12 @@ def run_session(
             model=model,
             add_base_tools=False,
             verbosity_level=0,
+            max_steps=8,
+            logger=_build_quiet_logger(),
+            # Markdown ```python blocks — most models emit these naturally,
+            # which dramatically reduces "Error in code parsing" retries
+            # vs. the default <code>...</code> tags.
+            code_block_tags="markdown",
         )
         # smolagents builds its own system prompt and treats `description=` /
         # task strings differently across versions. We splice ours in as a

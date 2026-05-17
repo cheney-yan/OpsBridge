@@ -162,8 +162,13 @@ def _create_agent_user() -> bool:
         print(f"  {ok('ok')} agent user already exists")
         return False
     print("  creating agent user ...")
+    # /bin/bash as the shell — sshd's ForceCommand overrides this for SSH
+    # logins, but sshd refuses connections to accounts with /usr/sbin/nologin
+    # regardless of ForceCommand. The agent is reachable ONLY via SSH (no
+    # password set, no console access), so the login-shell choice doesn't
+    # widen the attack surface.
     _run(["useradd", "--system", "--create-home", "--home-dir", str(AGENT_HOME),
-          "--shell", "/usr/sbin/nologin", "--user-group", "agent"])
+          "--shell", "/bin/bash", "--user-group", "agent"])
     return True
 
 
@@ -216,6 +221,7 @@ def _ensure_sshd_snippet() -> None:
                 X11Forwarding no
                 AllowTcpForwarding no
                 PermitTunnel no
+                ExposeAuthInfo yes
                 ForceCommand /opt/opsbridge/agent/.venv/bin/agent
         """)
     else:

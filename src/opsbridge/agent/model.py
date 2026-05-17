@@ -26,10 +26,20 @@ class ModelConfig:
 
     @property
     def model_id(self) -> str:
-        """Provider-prefixed model id LiteLLM expects (e.g. anthropic/claude-...)."""
+        """Provider-prefixed model id LiteLLM expects.
+
+        When `base_url` is set we are talking to an OpenAI-compatible proxy
+        (Azure / Bedrock proxy / vLLM / litellm gateway / our test proxy /
+        …). The proxy speaks OpenAI's protocol regardless of which vendor
+        actually serves the model behind it, so we tag the model_id with
+        `openai/` to make LiteLLM route over the OpenAI client. When
+        `base_url` is empty we go straight to the vendor's native endpoint
+        and use the provider prefix as the operator picked it.
+        """
         if "/" in self.model:
             return self.model
-        return f"{self.provider}/{self.model}"
+        effective_provider = "openai" if self.base_url else self.provider
+        return f"{effective_provider}/{self.model}"
 
 
 def load_config(
