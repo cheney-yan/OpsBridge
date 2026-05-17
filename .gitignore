@@ -2,7 +2,7 @@
 TEST.local.md
 
 # Claude Code per-user settings
-.claude/settings.local.json
+.claude/
 
 # Python
 __pycache__/
