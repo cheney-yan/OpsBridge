@@ -34,6 +34,15 @@ authorized SSH pubkey.
 curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/main/install.sh | bash
 ```
 
+Pin a specific commit, branch, or tag — pass it as both the URL path
+and to `bash -s`:
+
+```bash
+REF=v0.3.0 && \
+curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/$REF/install.sh \
+  | bash -s $REF
+```
+
 > **Note**: no leading `sudo`. The installer handles privilege escalation
 > itself so its `sudo` invocation is connected to your actual terminal —
 > avoiding the broken-pty trap where `curl | sudo bash` silently fails on

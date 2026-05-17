@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # OpsBridge one-liner installer.
 #
-# Recommended (interactive):
+# Recommended (interactive, default main):
 #     curl -fsSL .../install.sh | bash         ← no leading sudo
+#
+# Pin a specific commit / branch / tag (REF):
+#     curl -fsSL .../REF/install.sh | bash -s REF
+#
+# (The repo path REF and the `-s REF` arg should match. install.sh has no
+# way to read its origin URL when piped via curl, so the operator names
+# the version once via -s. Default REF if absent: main.)
 #
 # Non-interactive (CI / Ansible):
 #     OPSBRIDGE_PROVIDER=anthropic \
@@ -81,7 +88,14 @@ fi
 # (or /dev/null in env-var mode).
 
 REPO_URL="${OPSBRIDGE_REPO_URL:-https://github.com/cheney-yan/OpsBridge.git}"
-REPO_REF="${OPSBRIDGE_REPO_REF:-main}"
+# REPO_REF resolution order:
+#   1. First positional arg ($1)         — `bash -s <ref>` from curl-pipe
+#   2. OPSBRIDGE_REPO_REF env var        — non-interactive CI / Ansible
+#   3. "main"                             — default for the published one-liner
+# install.sh has no way to know which URL it was fetched from (curl-pipe
+# strips origin metadata), so the operator must say the ref once — either
+# as `bash -s b0a0b06` or via the env var.
+REPO_REF="${1:-${OPSBRIDGE_REPO_REF:-main}}"
 SRC_DIR="${OPSBRIDGE_SRC_DIR:-/opt/opsbridge-src}"
 SUPPORTS_TTY=0
 [[ -t 0 ]] && SUPPORTS_TTY=1
