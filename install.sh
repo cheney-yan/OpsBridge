@@ -13,22 +13,38 @@
 # Re-running is safe — choose [k]eep / [r]econfigure / [a]bort on prompt.
 set -euo pipefail
 
+# -----------------------------------------------------------------------------
+# Pipe → tmpfile self re-exec
+# -----------------------------------------------------------------------------
+# `curl … | sudo bash` makes bash read its OWN script from stdin (fd 0). Any
+# later `read -r` or `exec </dev/tty` to swap fd 0 to the operator's TTY
+# breaks bash's ability to keep reading remaining script bytes — under sudo's
+# default `use_pty` mode the swap fails with EIO and bash exits with:
+#
+#     bash: error reading input file: Input/output error
+#
+# Robust fix: when our $BASH_SOURCE[0] is empty (= we're being read from a
+# pipe), slurp the rest of stdin into a tmpfile and `exec bash <tmpfile>`,
+# attaching the operator's TTY as the new fd 0. From there on `read` works
+# normally and there's no /dev/tty trickery anywhere else in the script.
+# Falls back to /dev/null if no controlling terminal (CI / non-interactive
+# env-var-driven install).
+if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
+    _ob_install_tmp=$(mktemp /tmp/opsbridge-install.XXXXXX.sh)
+    cat > "$_ob_install_tmp"
+    chmod +x "$_ob_install_tmp"
+    if (: </dev/tty) 2>/dev/null; then
+        exec bash "$_ob_install_tmp" "$@" </dev/tty
+    else
+        exec bash "$_ob_install_tmp" "$@" </dev/null
+    fi
+fi
+
 REPO_URL="${OPSBRIDGE_REPO_URL:-https://github.com/cheney-yan/OpsBridge.git}"
 REPO_REF="${OPSBRIDGE_REPO_REF:-main}"
 SRC_DIR="${OPSBRIDGE_SRC_DIR:-/opt/opsbridge-src}"
 SUPPORTS_TTY=0
-
-# Re-attach stdin to /dev/tty if curl piped us.
-# [[ -e /dev/tty ]] checks existence (a special file always exists on Linux)
-# but opening fails with ENXIO when the process has no controlling terminal —
-# common under `sudo`, container exec, or CI runners. So we feature-detect by
-# actually opening it inside a subshell and only swap fds if that succeeds.
-if [[ ! -t 0 ]] && (exec </dev/tty) 2>/dev/null; then
-    exec </dev/tty
-fi
-if [[ -t 0 ]]; then
-    SUPPORTS_TTY=1
-fi
+[[ -t 0 ]] && SUPPORTS_TTY=1
 
 log()   { printf '\033[1;36m[install]\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[install]\033[0m %s\n' "$*" >&2; }
