@@ -234,26 +234,31 @@ normalize_base_url() {
     local key="$OPSBRIDGE_API_KEY"
     base="${base%/}"
 
-    # As-given /models — happy path, nothing to do.
-    if curl -fsS -m 8 -o /dev/null -H "Authorization: Bearer $key" "$base/models" 2>/dev/null; then
-        OPSBRIDGE_BASE_URL="$base"
-        export OPSBRIDGE_BASE_URL
-        return 0
+    # Build candidate layouts to probe in priority order:
+    #   1. as-given                            (respect what the operator typed)
+    #   2. if no /vN suffix → append /v1       (cliapi, vLLM, most OpenAI proxies)
+    #   3. if /vN suffix → strip it            (rare proxy roots at the host)
+    # First /models that returns 2xx wins. If both directions fail, leave
+    # the URL untouched and downstream tools surface the error.
+    local -a candidates=("$base")
+    if [[ "$base" =~ /v[0-9]+$ ]]; then
+        candidates+=("${base%/v*}")
+    else
+        candidates+=("$base/v1")
     fi
 
-    # If the URL doesn't already end in /vN, try appending /v1.
-    if [[ ! "$base" =~ /v[0-9]+$ ]]; then
-        if curl -fsS -m 8 -o /dev/null -H "Authorization: Bearer $key" "$base/v1/models" 2>/dev/null; then
-            log "  base URL auto-corrected: $base → $base/v1"
-            OPSBRIDGE_BASE_URL="$base/v1"
+    local cand
+    for cand in "${candidates[@]}"; do
+        if curl -fsS -m 8 -o /dev/null -H "Authorization: Bearer $key" "$cand/models" 2>/dev/null; then
+            if [[ "$cand" != "$base" ]]; then
+                log "  base URL auto-corrected: $base → $cand"
+            fi
+            OPSBRIDGE_BASE_URL="$cand"
             export OPSBRIDGE_BASE_URL
             return 0
         fi
-    fi
+    done
 
-    # Neither layout works. Leave the value the operator typed and let
-    # downstream tools (discover_models, check_llm_endpoint) report it
-    # with their normal error hints.
     OPSBRIDGE_BASE_URL="$base"
     export OPSBRIDGE_BASE_URL
     return 1
@@ -329,55 +334,78 @@ default_model_from_list() {
     echo "$pick"
 }
 
-# Ask the operator to pick a model, after we have URL + key (so we can
-# discover what the endpoint actually serves). Falls back gracefully to
-# free-text entry when discovery fails.
+# Ask the operator to pick a model, then test it end-to-end with a tiny
+# "hi" round-trip. If the chosen model 4xx's, loop and let them pick another
+# without restarting the install. Discovery-list output is cached across
+# iterations so re-prompting doesn't re-hit /v1/models.
 prompt_for_model() {
     local provider="$OPSBRIDGE_PROVIDER"
     local models default
-
     local _ep="${OPSBRIDGE_BASE_URL:-the vendor default endpoint}"
+
     log "discovering models from $_ep ..."
     models=$(discover_models 2>/dev/null) || true
+
+    # If discovery returned nothing, free-text entry only. Still loop on
+    # round-trip failure so a typo doesn't strand the operator.
     if [[ -z "$models" ]]; then
         warn "  couldn't fetch /v1/models — type a model id manually."
         case "$provider" in
             openai)    default="gpt-4.1-mini" ;;
             anthropic) default="claude-sonnet-4-6" ;;
         esac
-        read -r -p "Model [$default]: " model
-        OPSBRIDGE_MODEL="${model:-$default}"
-        export OPSBRIDGE_MODEL
-        return 0
+        while :; do
+            local model
+            read -r -p "Model [$default]: " model
+            OPSBRIDGE_MODEL="${model:-$default}"
+            export OPSBRIDGE_MODEL
+            if check_llm_endpoint; then
+                return 0
+            fi
+            echo
+            warn "Try another model id."
+            echo
+        done
     fi
 
     default=$(default_model_from_list "$provider" "$models")
-    echo
-    log "Available models (numbered list, recommended starred):"
-    local arr=() i=1 m
-    while IFS= read -r m; do
-        [[ -z "$m" ]] && continue
-        arr+=("$m")
-        if [[ "$m" == "$default" ]]; then
-            printf '  %2d. %s ★ recommended\n' "$i" "$m"
+
+    while :; do
+        echo
+        log "Available models (numbered list, recommended starred):"
+        local arr=() i=1 m
+        while IFS= read -r m; do
+            [[ -z "$m" ]] && continue
+            arr+=("$m")
+            if [[ "$m" == "$default" ]]; then
+                printf '  %2d. %s ★ recommended\n' "$i" "$m"
+            else
+                printf '  %2d. %s\n' "$i" "$m"
+            fi
+            ((i++))
+            [[ "$i" -gt 15 ]] && { printf '  ... (%d more)\n' $(($(printf '%s\n' "$models" | wc -l) - 15)); break; }
+        done <<< "$models"
+        echo
+        local choice
+        read -r -p "Pick a number, or paste a model id [default: $default]: " choice
+        if [[ -z "$choice" ]]; then
+            OPSBRIDGE_MODEL="$default"
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#arr[@]} )); then
+            OPSBRIDGE_MODEL="${arr[$((choice-1))]}"
         else
-            printf '  %2d. %s\n' "$i" "$m"
+            OPSBRIDGE_MODEL="$choice"
         fi
-        ((i++))
-        [[ "$i" -gt 15 ]] && { printf '  ... (%d more)\n' $(($(printf '%s\n' "$models" | wc -l) - 15)); break; }
-    done <<< "$models"
-    echo
-    local choice
-    read -r -p "Pick a number, or paste a model id [default: $default]: " choice
-    if [[ -z "$choice" ]]; then
-        OPSBRIDGE_MODEL="$default"
-    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#arr[@]} )); then
-        OPSBRIDGE_MODEL="${arr[$((choice-1))]}"
-    else
-        OPSBRIDGE_MODEL="$choice"
-    fi
-    export OPSBRIDGE_MODEL
-    echo "  selected: $OPSBRIDGE_MODEL"
+        export OPSBRIDGE_MODEL
+        echo "  selected: $OPSBRIDGE_MODEL"
+
+        # Tiny round-trip with the selected model. If it works we're done;
+        # if not, fall through to re-pick.
+        if check_llm_endpoint; then
+            return 0
+        fi
+        echo
+        warn "Pick a different model (or paste an id)."
+    done
 }
 
 prompt_for_config() {
@@ -537,18 +565,11 @@ if [[ "$SUPPORTS_TTY" -eq 0 && -z "${OPSBRIDGE_API_KEY:-}" ]]; then
     die "no TTY and no OPSBRIDGE_API_KEY — set env vars (see install.sh header) or run with a TTY"
 fi
 if [[ "$NEEDS_PROMPT" -eq 1 ]]; then
-    # Interactive: loop on the LLM probe so a wrong model/URL gets fixed
-    # before any /etc files are written.
-    while :; do
-        prompt_for_config
-        show_config_review
-        if check_llm_endpoint; then
-            break
-        fi
-        echo
-        warn "Endpoint didn't accept the config above. Re-enter values, or Ctrl-C to abort."
-        echo
-    done
+    # Interactive: prompt_for_model already runs check_llm_endpoint in
+    # a loop, so by the time we get past prompt_for_config we know the
+    # provider/url/key/model combination actually accepts a hello.
+    prompt_for_config
+    show_config_review
     prompt_for_pubkey
 elif [[ -n "${OPSBRIDGE_API_KEY:-}" ]]; then
     # Env-var mode: probe once, surface failure prominently but proceed
