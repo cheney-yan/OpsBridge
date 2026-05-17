@@ -500,12 +500,18 @@ def _run_tui_session(
             hostname=socket.gethostname(),
         )
 
-        # Inter-thread plumbing.
-        turn_queue: queue.Queue[str | None] = queue.Queue()
+        # Inter-thread plumbing. Operator messages are typed:
+        #   ("turn", text)       — regular English-routed request → LLM
+        #   ("!", command)       — operator direct bash (§12); skip the LLM
+        #   None                 — sentinel: end the loop
+        turn_queue: queue.Queue = queue.Queue()
         cancel_requested = threading.Event()
 
         def _on_operator_turn(text: str) -> None:
-            turn_queue.put(text)
+            turn_queue.put(("turn", text))
+
+        def _on_direct_bash(cmd: str) -> None:
+            turn_queue.put(("!", cmd))
 
         def _on_cancel() -> None:
             cancel_requested.set()
@@ -515,6 +521,7 @@ def _run_tui_session(
             model_label=config.model,
             on_operator_turn=_on_operator_turn,
             on_cancel=_on_cancel,
+            on_direct_bash=_on_direct_bash,
         )
 
         bundle = _build_agent(
@@ -524,15 +531,48 @@ def _run_tui_session(
             app=app,
         )
 
+        # Locate the BashTool instance — we reach into it directly for the
+        # `!`-prefix path so both LLM-routed and operator-direct bash share
+        # the same sticky-cwd state.
+        bash_tool = next(
+            (tool for tool in bundle.tools if isinstance(tool, t.BashTool)),
+            None,
+        )
+
         nonlocal_state = {"turns": 0, "end_reason": "clean"}
+
+        def _handle_direct_bash(cmd: str) -> None:
+            """Run an operator-typed `!cmd` directly via the BashTool, bypassing
+            the LLM. Audit chain (bash_pre_exec + tool_call w/ source=direct)
+            still fires; the cwd indicator follows the command across calls.
+            """
+            if bash_tool is None:
+                app.write_top("[!] bash tool not wired in this session")
+                return
+            try:
+                bash_tool.run_direct(cmd)
+            except Exception as exc:  # noqa: BLE001
+                app.write_top(f"[! error] {exc}")
+                logger.emit("direct_bash_error", command=cmd, error=str(exc))
 
         def _agent_loop() -> None:
             while True:
-                user_msg = turn_queue.get()
-                if user_msg is None:
+                msg = turn_queue.get()
+                if msg is None:
                     nonlocal_state["end_reason"] = "eof"
                     break
-                user_msg = user_msg.strip()
+
+                # Backwards-compat: stale callers might still put bare strings.
+                if isinstance(msg, str):
+                    msg = ("turn", msg)
+                kind, payload = msg
+
+                if kind == "!":
+                    _handle_direct_bash(payload)
+                    continue
+
+                # kind == "turn"
+                user_msg = (payload or "").strip()
                 if not user_msg:
                     continue
                 turn = nonlocal_state["turns"] = nonlocal_state["turns"] + 1
@@ -551,7 +591,7 @@ def _run_tui_session(
                     task = user_msg
 
                 logger.emit("turn_start", turn=turn, user_msg=user_msg)
-                app.set_status("thinking", f"step 1")
+                app.set_status("thinking")
                 try:
                     result = bundle.agent.run(task, reset=(turn == 1))
                 except Exception as exc:  # noqa: BLE001
@@ -561,7 +601,7 @@ def _run_tui_session(
                         error=str(exc),
                         error_type=type(exc).__name__,
                     )
-                    app.set_status("idle", "error")
+                    app.set_status("idle")
                     app.set_final_answer(f"[error] {exc}")
                     if _is_network_error(exc):
                         nonlocal_state["end_reason"] = "network_error"
@@ -580,12 +620,16 @@ def _run_tui_session(
                     tokens_used=bundle.budget.used,
                     ratio=bundle.budget.ratio,
                 )
-                app.set_status("idle", "")
+                app.set_status("idle")
 
                 if not bundle.budget.warned_soft and bundle.budget.ratio >= SOFT_THRESHOLD:
                     app.write_top(f"[context: {pct}% used]")
                     bundle.budget.warned_soft = True
                 if not bundle.budget.compressed_once and bundle.budget.ratio >= COMPRESS_THRESHOLD:
+                    # Note the compress-LLM-call BEFORE it runs — Phase 2 only
+                    # surfaced it after, leaving the operator wondering why
+                    # the agent went quiet for ~3s.
+                    app.write_top("[context compressing — summarizing older steps]")
                     _try_compress_memory(bundle.agent, bundle.model, logger)
                     bundle.budget.compressed_once = True
                     app.write_top("[context compressed — older steps summarized]")

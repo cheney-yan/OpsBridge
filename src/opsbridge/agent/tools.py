@@ -146,6 +146,51 @@ def tool_write(path: str, content: str) -> str:
 DEFAULT_BASH_TIMEOUT = 60
 DEFAULT_BASH_CWD = "/home/agent"
 
+# Phase 3 §13: sticky cwd. We wrap each command with a `; printf MARK + pwd
+# + MARK` tail so we can scrape the post-command cwd from captured output
+# and pass it back as the cwd for the NEXT bash call. Markers are unlikely
+# to appear in real output and pass through the ANSI sanitiser unchanged.
+_CWD_MARK_START = "__OPSBRIDGE_CWD_BEGIN__"
+_CWD_MARK_END = "__OPSBRIDGE_CWD_END__"
+_CWD_MARK_RE = re.compile(
+    rf"\n?{re.escape(_CWD_MARK_START)}(.*?){re.escape(_CWD_MARK_END)}\n?",
+    re.DOTALL,
+)
+
+
+def _wrap_cwd_capture(command: str) -> str:
+    """Append a pwd-printing tail to the operator's command so we can scrape
+    the new cwd out of the captured output.
+
+    Uses `{ ... ; }` grouping so the cwd-print runs in the SAME shell as the
+    command — `cd` inside the command persists for the printf. If the command
+    `exit`s early or the wrapping is broken (unbalanced braces), the marker
+    simply doesn't fire and the caller keeps the previous cwd.
+    """
+    # Preserve the original command's exit code via $? — printf runs AFTER
+    # the command but musn't overwrite the operator-visible $?.
+    return (
+        f"{{ {command}\n}}\n_OB_RC=$?\n"
+        f"printf '\\n%s%s%s\\n' '{_CWD_MARK_START}' \"$(pwd 2>/dev/null)\" '{_CWD_MARK_END}'\n"
+        f"exit $_OB_RC"
+    )
+
+
+def _extract_cwd(output: str) -> tuple[str, str | None]:
+    """Strip the cwd marker from captured output and return the captured cwd.
+
+    Returns (cleaned_output, cwd_or_None). When no marker is present (early
+    exit, parse hiccup), returns (output, None).
+    """
+    m = _CWD_MARK_RE.search(output)
+    if not m:
+        return output, None
+    cwd = (m.group(1) or "").strip()
+    cleaned = (_CWD_MARK_RE.sub("", output, count=1)).rstrip()
+    if cleaned:
+        cleaned += "\n"
+    return cleaned, (cwd or None)
+
 
 def _stream_lines(
     proc: subprocess.Popen,
@@ -186,15 +231,23 @@ def tool_bash(
     line_sink: Callable[[str], None] | None = None,
     cwd: str = DEFAULT_BASH_CWD,
     pre_exec: Callable[[], None] | None = None,
+    track_cwd: bool = True,
 ) -> tuple[str, dict]:
     """Run a shell command via `bash -lc`.
 
     Captures stdout+stderr merged. Returns the captured output (sanitized)
-    plus a metadata dict (exit code, duration, timeout flag).
+    plus a metadata dict (exit code, duration, timeout flag, and — when
+    `track_cwd=True` and the command runs to completion — the post-command
+    cwd via `meta["cwd"]`).
 
     `pre_exec` fires *before* the subprocess starts — the caller hooks
     `bash_pre_exec` audit logging there so the trail survives even if
-    the process is killed mid-run (TEST-phase2.md §2.5).
+    the process is killed mid-run.
+
+    `track_cwd` (phase-3 §13): when True, wrap the command with a pwd
+    capture tail so the sticky-cwd indicator can follow `cd` operations
+    across calls. Operators using `!` prefix to chain commands rely on
+    this. Set False for callers that want strictly unaltered execution.
     """
     if not Path(cwd).exists():
         cwd = os.path.expanduser("~")
@@ -205,12 +258,14 @@ def tool_bash(
         except Exception:  # noqa: BLE001
             pass
 
+    effective_cmd = _wrap_cwd_capture(command) if track_cwd else command
+
     started = time.monotonic()
     timed_out = False
 
     try:
         proc = subprocess.Popen(
-            ["bash", "-lc", command],
+            ["bash", "-lc", effective_cmd],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=cwd,
@@ -256,14 +311,23 @@ def tool_bash(
     duration_ms = int((time.monotonic() - started) * 1000)
 
     output = output_holder.get("data", "")
+
+    # Extract cwd from the wrapped tail BEFORE any timeout suffix is appended.
+    captured_cwd: str | None = None
+    if track_cwd and not timed_out:
+        output, captured_cwd = _extract_cwd(output)
+
     if timed_out:
         output += f"\n[timeout after {timeout_sec}s]"
 
-    return output, {
+    meta: dict = {
         "exit": proc.returncode if proc.returncode is not None else -1,
         "duration_ms": duration_ms,
         "timeout": timed_out,
     }
+    if captured_cwd:
+        meta["cwd"] = captured_cwd
+    return output, meta
 
 
 # ---------------------------------------------------------------------------
@@ -699,24 +763,48 @@ class BashTool(Tool):
     }
     output_type = "string"
 
-    def __init__(self, logger=None, app=None):
+    def __init__(self, logger=None, app=None, cwd: str = DEFAULT_BASH_CWD):
         super().__init__()
         self._logger = logger
         self._app = app
+        # Phase 3 §13: sticky cwd. Starts at the install-time default; every
+        # successful bash call updates it from the wrapped pwd capture. The
+        # next call (LLM-routed or `!`-prefix direct) inherits it.
+        self._current_cwd = cwd
+        if self._app is not None:
+            try:
+                self._app.set_cwd(cwd)
+            except Exception:  # noqa: BLE001
+                pass
 
-    def _line_sink(self, line: str) -> None:
-        if self._app is None:
-            return
-        try:
-            self._app.write_top(f"$ {line}" if False else line)
-        except Exception:  # noqa: BLE001
-            pass
+    @property
+    def current_cwd(self) -> str:
+        return self._current_cwd
 
     def forward(self, command: str, timeout_sec: int = DEFAULT_BASH_TIMEOUT) -> str:
+        """smolagents-facing entrypoint. LLM-routed by definition.
+
+        Operator-direct (§12 `!`) calls bypass smolagents' tool dispatch and
+        invoke `run_direct` directly, so the `source` field can vary without
+        breaking smolagents' inputs-vs-signature validation.
+        """
+        return self._exec(command, timeout_sec, source="llm")
+
+    def _exec(self, command: str, timeout_sec: int, *, source: str) -> str:
+        """Shared exec path for both `forward` (LLM) and `run_direct` (operator).
+
+        `source` distinguishes the two in the audit log so retrospective
+        readers can tell operator-typed commands from LLM-generated ones.
+        """
         t0 = time.monotonic()
         sink: Callable[[str], None] | None = None
         if self._app is not None:
-            self._app.write_top(f"$ {command}")
+            # Echo: `$ ...` for LLM-routed, `! ...` for direct (already echoed
+            # by the TUI's input handler in the direct case; but the agent
+            # thread does it for LLM-routed).
+            if source == "llm":
+                self._app.write_top(f"$ {command}")
+            self._app.set_status("running bash")
             sink = lambda line: self._app.write_top(line)
 
         def _pre_exec() -> None:
@@ -725,6 +813,7 @@ class BashTool(Tool):
                     "bash_pre_exec",
                     command=command,
                     timeout_sec=timeout_sec,
+                    source=source,
                 )
 
         result, meta = tool_bash(
@@ -732,7 +821,25 @@ class BashTool(Tool):
             timeout_sec=timeout_sec,
             line_sink=sink,
             pre_exec=_pre_exec,
+            cwd=self._current_cwd,
         )
+
+        # Sticky-cwd update: if the command moved us, follow it.
+        new_cwd = meta.get("cwd")
+        if new_cwd and Path(new_cwd).exists() and new_cwd != self._current_cwd:
+            self._current_cwd = new_cwd
+            if self._app is not None:
+                try:
+                    self._app.set_cwd(new_cwd)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        if self._app is not None:
+            try:
+                self._app.set_status("idle")
+            except Exception:  # noqa: BLE001
+                pass
+
         if self._logger:
             self._logger.emit(
                 "tool_call",
@@ -742,8 +849,16 @@ class BashTool(Tool):
                 duration_ms=meta["duration_ms"],
                 exit=meta["exit"],
                 timeout=meta["timeout"],
+                source=source,
             )
         return result
+
+    def run_direct(self, command: str, timeout_sec: int = DEFAULT_BASH_TIMEOUT) -> str:
+        """Operator-initiated direct exec (`!` prefix). Same as `forward` but
+        tagged `source="direct"` in audit so retrospective reads can tell
+        operator-typed commands from LLM-generated ones.
+        """
+        return self._exec(command, timeout_sec, source="direct")
 
 
 class SearchTool(Tool):
@@ -776,6 +891,7 @@ class SearchTool(Tool):
         if self._app is not None:
             try:
                 self._app.write_top(f"[search] {query!r}")
+                self._app.set_status("searching")
             except Exception:  # noqa: BLE001
                 pass
         # Per-call backend if injected; otherwise smolagents WebSearchTool.
@@ -783,6 +899,7 @@ class SearchTool(Tool):
         if self._app is not None:
             try:
                 self._app.write_top(f"[search] → {meta.get('result_count', 0)} results")
+                self._app.set_status("idle")
             except Exception:  # noqa: BLE001
                 pass
         if self._logger:
@@ -835,6 +952,7 @@ class VisitTool(Tool):
         if self._app is not None:
             try:
                 self._app.write_top(f"[visit] {url}")
+                self._app.set_status("visiting")
             except Exception:  # noqa: BLE001
                 pass
         result, meta = tool_visit(
@@ -850,6 +968,7 @@ class VisitTool(Tool):
                     f"[visit] ← {meta.get('bytes', 0)} bytes"
                     + (" [truncated]" if meta.get("truncated") else "")
                 )
+                self._app.set_status("idle")
             except Exception:  # noqa: BLE001
                 pass
         if self._logger:
