@@ -114,8 +114,12 @@ async def test_ime_duplicate_submit_is_deduped():
 
 @pytest.mark.asyncio
 async def test_identical_resubmit_after_window_is_allowed():
-    """A real `same-message-again` gesture (after IME_DUPLICATE_WINDOW_SEC)
-    must NOT be deduped — that would silently swallow operator intent."""
+    """A real `same-message-again` gesture must not be deduped.
+
+    Two paths get through the IME guard:
+      1. An Input.Changed event in between (operator typed new content).
+      2. Time-window expires.
+    """
     import asyncio as _asyncio
     sent: list[str] = []
     app = OpsBridgeApp(
@@ -123,16 +127,62 @@ async def test_identical_resubmit_after_window_is_allowed():
         on_operator_turn=lambda t: sent.append(t),
         on_cancel=lambda: None,
     )
-    # Shrink the window for the test.
-    app.IME_DUPLICATE_WINDOW_SEC = 0.05
+    app.IME_DUPLICATE_WINDOW_SEC = 0.05  # shrink for the test
     async with app.run_test() as pilot:
         inp = app.query_one(WidthAwareInput)
         from textual.widgets._input import Input
         await app.on_input_submitted(Input.Submitted(inp, "again", None))
-        await _asyncio.sleep(0.1)
+        await _asyncio.sleep(0.1)   # past the window
         await app.on_input_submitted(Input.Submitted(inp, "again", None))
         await pilot.pause()
     assert sent == ["again", "again"]
+
+
+@pytest.mark.asyncio
+async def test_resubmit_after_value_change_is_allowed_immediately():
+    """If Input.Changed fires with non-empty value between two same-text
+    submits, the second goes through even WITHIN the dedupe window —
+    because the operator clearly re-composed input.
+    """
+    sent: list[str] = []
+    app = OpsBridgeApp(
+        hostname="h", model_label="m",
+        on_operator_turn=lambda t: sent.append(t),
+        on_cancel=lambda: None,
+    )
+    async with app.run_test() as pilot:
+        inp = app.query_one(WidthAwareInput)
+        from textual.widgets._input import Input
+        await app.on_input_submitted(Input.Submitted(inp, "ping", None))
+        # Simulate the operator typing "ping" again.
+        await app.on_input_changed(Input.Changed(inp, "ping", None))
+        await app.on_input_submitted(Input.Submitted(inp, "ping", None))
+        await pilot.pause()
+    assert sent == ["ping", "ping"]
+
+
+@pytest.mark.asyncio
+async def test_clear_value_event_does_not_break_dedupe():
+    """Our `message.input.value = ""` triggers Input.Changed with an empty
+    string. That MUST NOT count as new operator content — otherwise the
+    IME duplicate that arrives just after our clear would slip through.
+    """
+    sent: list[str] = []
+    app = OpsBridgeApp(
+        hostname="h", model_label="m",
+        on_operator_turn=lambda t: sent.append(t),
+        on_cancel=lambda: None,
+    )
+    async with app.run_test() as pilot:
+        inp = app.query_one(WidthAwareInput)
+        from textual.widgets._input import Input
+        await app.on_input_submitted(Input.Submitted(inp, "echo", None))
+        # Our clear emits this Changed event:
+        await app.on_input_changed(Input.Changed(inp, "", None))
+        # IME's duplicate Submitted arrives:
+        await app.on_input_submitted(Input.Submitted(inp, "echo", None))
+        await pilot.pause()
+    assert sent == ["echo"]  # second submit was deduped
 
 
 @pytest.mark.asyncio

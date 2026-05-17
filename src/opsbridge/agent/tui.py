@@ -407,12 +407,12 @@ class OpsBridgeApp(App):
     # polite message — prevents runaway buildup when the agent is hung.
     MAX_QUEUE_DEPTH = 5
 
-    # If the same text is submitted twice within this window, treat the
-    # second one as an IME / voice-input duplicate (see _last_submit_*
-    # comment in __init__). 400ms is enough to absorb the IME's double-
-    # fire but short enough that a real "send the same message again"
-    # operator gesture isn't blocked.
-    IME_DUPLICATE_WINDOW_SEC = 0.4
+    # Wider safety-net window for the time-based dedupe. The primary
+    # dedupe is now "no keystrokes between two identical submits" (see
+    # _last_submit_* in __init__ + on_input_submitted), which catches
+    # IME / voice-input duplicates regardless of delay. The time window
+    # below is a backup for environments that swallow our Key events.
+    IME_DUPLICATE_WINDOW_SEC = 3.0
 
     def __init__(
         self,
@@ -449,14 +449,25 @@ class OpsBridgeApp(App):
         # §5 queue-depth tracker. Bumped at submit, decremented when the
         # agent thread reports turn_end via `notify_turn_done`.
         self._in_flight: int = 0
-        # IME / voice-input debounce: macOS Terminal + Chinese IME (and
-        # some voice-input modes) emit `Input.Submitted` TWICE for a single
-        # Enter — once for "confirm composition", once for "newline". Both
-        # messages carry the same captured value; both fire on_input_submitted.
-        # We dedupe by remembering the last (text, monotonic) pair and
-        # ignoring identical submits within IME_DUPLICATE_WINDOW_SEC.
+        # IME / voice-input dedupe state. macOS Terminal + Chinese IMEs and
+        # voice-input modes queue `Input.Submitted` TWICE for one Enter
+        # (both messages capture the value at queue time, before our
+        # value-clear runs). We dedupe a Submitted as duplicate iff:
+        #
+        #   - text matches the previous submit, AND
+        #   - the input value hasn't received NEW content since the last
+        #     submit (`_input_value_changed_since_submit` False).
+        #
+        # The flag is flipped True by `on_input_changed` whenever the
+        # widget's value becomes non-empty (i.e., real user/IME composition).
+        # Our own `message.input.value = ""` clear is non-empty → empty,
+        # which is filtered out so it doesn't break the dedupe.
+        #
+        # Time window kept as a belt-and-suspenders bound for environments
+        # where Input.Changed somehow doesn't fire (theoretical safety).
         self._last_submit_text: str = ""
         self._last_submit_at: float = 0.0
+        self._input_value_changed_since_submit: bool = False
 
     # ----- composition ----------------------------------------------------
 
@@ -675,6 +686,15 @@ class OpsBridgeApp(App):
 
     # ----- key handling for the ask form ----------------------------------
 
+    async def on_input_changed(self, event: Input.Changed) -> None:
+        """Track whether the input value gained NEW content since the
+        last accepted submit. Used by the IME-duplicate dedupe in
+        on_input_submitted. We ignore the empty-string event our own
+        `value = ""` clear emits — that isn't "new operator content".
+        """
+        if event.value:
+            self._input_value_changed_since_submit = True
+
     async def on_key(self, event) -> None:
         # Picker key handling takes precedence when active.
         if self._active_picker is not None:
@@ -779,20 +799,24 @@ class OpsBridgeApp(App):
         if not text.strip():
             return
 
-        # IME / voice-input dedupe. Chinese IMEs on macOS Terminal (and
-        # some voice modes) emit Input.Submitted TWICE for a single Enter:
-        # the second message carries the same captured value because it
-        # was queued before our `message.input.value = ""` ran. We dedupe
-        # by content + time. A real "send this again" gesture takes longer
-        # than IME_DUPLICATE_WINDOW_SEC for a human, so it isn't blocked.
+        # IME / voice-input dedupe — see _last_submit_* in __init__.
+        # The second Submitted from a CJK IME / voice-input arrives with
+        # the same captured value but WITHOUT a new Input.Changed event
+        # bumping our `_input_value_changed_since_submit` flag, because the
+        # operator never typed anything new — the duplicate came from a
+        # queued Submitted message, not fresh composition.
         now = time.monotonic()
-        if (
+        is_duplicate = (
             text == self._last_submit_text
+            and not self._input_value_changed_since_submit
             and (now - self._last_submit_at) < self.IME_DUPLICATE_WINDOW_SEC
-        ):
+        )
+        if is_duplicate:
+            self.write_top("[ime duplicate suppressed]", kind="system")
             return
         self._last_submit_text = text
         self._last_submit_at = now
+        self._input_value_changed_since_submit = False
 
         # Any keystroke past the arm window disarms quit.
         self._quit_armed_at = None
