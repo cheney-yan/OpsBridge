@@ -501,12 +501,20 @@ def _check_api():
 # enable / disable
 # ---------------------------------------------------------------------------
 
+def _set_agent_shell(shell: str) -> None:
+    """Flip the agent user's login shell. Used by enable/disable."""
+    if _user_exists("agent"):
+        subprocess.run(["chsh", "-s", shell, "agent"], check=False, capture_output=True)
+
+
 def cmd_enable(args: argparse.Namespace) -> int:
     require_root()
     if SSHD_SNIPPET_DISABLED.exists() and not SSHD_SNIPPET_PATH.exists():
         SSHD_SNIPPET_DISABLED.rename(SSHD_SNIPPET_PATH)
     elif not SSHD_SNIPPET_PATH.exists():
         _ensure_sshd_snippet()
+    # Restore bash so ForceCommand can take over for SSH.
+    _set_agent_shell("/bin/bash")
     _reload_sshd()
     print(ok("agent SSH login enabled."))
     return 0
@@ -516,6 +524,10 @@ def cmd_disable(args: argparse.Namespace) -> int:
     require_root()
     if SSHD_SNIPPET_PATH.exists():
         SSHD_SNIPPET_PATH.rename(SSHD_SNIPPET_DISABLED)
+    # Without ForceCommand, sshd would drop the operator into /bin/bash. Flip
+    # the agent shell to nologin so SSH is refused even if the snippet is
+    # bypassed.
+    _set_agent_shell("/usr/sbin/nologin")
     _reload_sshd()
     print(ok("agent SSH login disabled (existing sessions unaffected)."))
     return 0

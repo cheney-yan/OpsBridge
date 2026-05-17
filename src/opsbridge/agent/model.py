@@ -70,6 +70,14 @@ def load_config(
 
 def build_model(cfg: ModelConfig) -> LiteLLMModel:
     """Construct a smolagents LiteLLMModel from a ModelConfig."""
+    # Silence LiteLLM's "Give Feedback / Get Help: ..." print on exception paths
+    # — it goes to stdout and pollutes the operator's TUI.
+    try:
+        import litellm  # type: ignore
+        litellm.suppress_debug_info = True
+    except ImportError:
+        pass
+
     kwargs: dict = {"model_id": cfg.model_id, "api_key": cfg.api_key}
     if cfg.base_url:
         kwargs["api_base"] = cfg.base_url
