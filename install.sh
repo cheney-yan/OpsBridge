@@ -7,65 +7,36 @@
 # Pin a specific commit / branch / tag (REF):
 #     curl -fsSL .../REF/install.sh | bash -s REF
 #
-# (The repo path REF and the `-s REF` arg should match. install.sh has no
-# way to read its origin URL when piped via curl, so the operator names
-# the version once via -s. Default REF if absent: main.)
-#
 # Non-interactive (CI / Ansible):
 #     OPSBRIDGE_PROVIDER=anthropic \
-#     OPSBRIDGE_MODEL=claude-sonnet-4-6 \
+#     OPSBRIDGE_MODEL=claude-opus-4-7 \
 #     OPSBRIDGE_API_KEY=... \
 #     OPSBRIDGE_PUBKEY="ssh-ed25519 AAAA... me@host" \
 #     curl -fsSL .../install.sh | bash
 #
 # Why no leading sudo: `curl | sudo bash` is fundamentally broken for
-# interactive prompts. sudo's stdin is the curl pipe (not your terminal),
-# so under Ubuntu's `Defaults use_pty` the child pty has no path back to
-# you — `read`, `getpass`, and friends all see EOF or block forever. This
-# script handles sudo internally so its sudo invocation can attach to your
-# REAL TTY.
+# interactive prompts. This script handles sudo internally so its sudo
+# invocation can attach to your REAL TTY.
 #
 # Re-running is safe — choose [k]eep / [r]econfigure / [a]bort on prompt.
 set -euo pipefail
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Step 0: get the script onto disk + re-exec as root with a real TTY.
-# -----------------------------------------------------------------------------
-#
-# Why this is one big atomic block: when we're piped (`curl | bash`), bash
-# reads its script from stdin. The `cat > tmpfile` below slurps the REMAINDER
-# of stdin into a file. After cat exits, stdin is EOF and bash has nothing
-# more to read — it would just quietly exit without ever running anything
-# else in this file. So the slurp + sudo re-exec MUST be the last thing in
-# the if-piped branch.
-#
-# `exec sudo -E bash <tmpfile> </dev/tty` is the magic: sudo is invoked from
-# our current shell (not from a pipe), so its stdin is the operator's real
-# TTY, and sudo's child pty (under `Defaults use_pty`) wires up correctly to
-# the terminal. Subsequent prompts in bash and Python both work.
-
-# sudoers `Defaults env_reset` strips most env vars by default; `sudo -E`
-# also obeys env_check/env_delete, so OPSBRIDGE_* vars wouldn't make it
-# through. List them explicitly via --preserve-env.
-_OB_ENV_KEEP=OPSBRIDGE_PROVIDER,OPSBRIDGE_MODEL,OPSBRIDGE_BASE_URL,OPSBRIDGE_API_KEY,OPSBRIDGE_JINA_API_KEY,OPSBRIDGE_PUBKEY,OPSBRIDGE_REPO_URL,OPSBRIDGE_REPO_REF,OPSBRIDGE_SRC_DIR,OPSBRIDGE_STDERR,OPSBRIDGE_USE_SYSTEM_PYTHON
+# ---------------------------------------------------------------------------
+_OB_ENV_KEEP=OPSBRIDGE_PROVIDER,OPSBRIDGE_MODEL,OPSBRIDGE_API_KEY,OPSBRIDGE_PUBKEY,OPSBRIDGE_REPO_URL,OPSBRIDGE_REPO_REF,OPSBRIDGE_SRC_DIR,OPSBRIDGE_USE_SYSTEM_PYTHON,OPSBRIDGE_SKIP_LLM_CHECK
 
 if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
-    # We were piped. Slurp the rest of stdin and re-exec in one shot.
     _tmp=$(mktemp /tmp/opsbridge-install.XXXXXX.sh)
     cat > "$_tmp"
     chmod +x "$_tmp"
     if [[ "$(id -u)" -eq 0 ]]; then
-        # Already root (legacy `curl | sudo bash`). The current pty is
-        # detached from any usable input source (the curl pipe is gone),
-        # so interactive prompts will see EOF. Env-var mode still works.
         if (: </dev/tty) 2>/dev/null; then
             exec bash "$_tmp" "$@" </dev/tty
         else
             exec bash "$_tmp" "$@" </dev/null
         fi
     else
-        # Not root: re-elevate. sudo invoked from THIS shell (not a pipe),
-        # with our TTY as stdin, so sudo's child pty is properly connected.
         if (: </dev/tty) 2>/dev/null; then
             exec sudo --preserve-env="$_OB_ENV_KEEP" bash "$_tmp" "$@" </dev/tty
         else
@@ -74,8 +45,6 @@ if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
     fi
 fi
 
-# We're running from a real file (not a pipe). If we're not root yet
-# (i.e., the user invoked `bash install.sh` directly), sudo-elevate now.
 if [[ "$(id -u)" -ne 0 ]]; then
     if (: </dev/tty) 2>/dev/null; then
         exec sudo --preserve-env="$_OB_ENV_KEEP" bash "$0" "$@" </dev/tty
@@ -88,13 +57,6 @@ fi
 # (or /dev/null in env-var mode).
 
 REPO_URL="${OPSBRIDGE_REPO_URL:-https://github.com/cheney-yan/OpsBridge.git}"
-# REPO_REF resolution order:
-#   1. First positional arg ($1)         — `bash -s <ref>` from curl-pipe
-#   2. OPSBRIDGE_REPO_REF env var        — non-interactive CI / Ansible
-#   3. "main"                             — default for the published one-liner
-# install.sh has no way to know which URL it was fetched from (curl-pipe
-# strips origin metadata), so the operator must say the ref once — either
-# as `bash -s b0a0b06` or via the env var.
 REPO_REF="${1:-${OPSBRIDGE_REPO_REF:-main}}"
 SRC_DIR="${OPSBRIDGE_SRC_DIR:-/opt/opsbridge-src}"
 SUPPORTS_TTY=0
@@ -109,17 +71,14 @@ KERNEL=$(uname -s)
 case "$KERNEL" in
     Linux)  PLATFORM=linux ;;
     Darwin) PLATFORM=macos ;;
-    *)      die "OpsBridge supports Linux and macOS. Detected: $KERNEL. File an issue if you need BSD/other support." ;;
+    *)      die "OpsBridge supports Linux and macOS. Detected: $KERNEL." ;;
 esac
 log "platform: $PLATFORM"
 
 # --- 1b. ensure sshd is installed (Linux) -------------------------------------
-# Fresh containers (OrbStack, lxc, etc.) frequently ship without
-# openssh-server; the agent's whole reachability story depends on it.
-# Install + enable now, before anything else touches /etc/ssh.
 if [[ "$PLATFORM" == "linux" ]]; then
     if [[ ! -x /usr/sbin/sshd ]]; then
-        log "installing openssh-server (required for agent SSH access) ..."
+        log "installing openssh-server ..."
         if command -v apt-get >/dev/null 2>&1; then
             DEBIAN_FRONTEND=noninteractive apt-get update -q
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server
@@ -128,16 +87,46 @@ if [[ "$PLATFORM" == "linux" ]]; then
         elif command -v yum >/dev/null 2>&1; then
             yum install -y openssh-server
         else
-            die "openssh-server is missing and I don't recognize this distro's package manager (no apt/dnf/yum). Install it manually and re-run."
+            die "openssh-server missing and no recognized package manager. Install it manually and re-run."
         fi
     fi
     if command -v systemctl >/dev/null 2>&1; then
-        # Enable + start the service. `ssh` is the unit on Debian/Ubuntu;
-        # `sshd` on Fedora/RHEL. Try both, ignore "not found".
         systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd 2>/dev/null || \
             warn "could not enable ssh via systemctl — check manually"
     fi
 fi
+
+# --- 1c. ensure Node.js + npm are installed -----------------------------------
+_ensure_nodejs() {
+    if command -v npm >/dev/null 2>&1; then
+        log "npm: $(command -v npm) ($(npm --version))"
+        return 0
+    fi
+    log "npm not found — installing Node.js ..."
+    if [[ "$PLATFORM" == "linux" ]]; then
+        if command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get update -q
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nodejs npm
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y nodejs npm
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y nodejs npm
+        else
+            die "npm missing and no recognized package manager. Install Node.js manually: https://nodejs.org/"
+        fi
+    elif [[ "$PLATFORM" == "macos" ]]; then
+        if command -v brew >/dev/null 2>&1; then
+            brew install node
+        else
+            die "npm missing. Install Node.js: brew install node  or  https://nodejs.org/"
+        fi
+    fi
+    if ! command -v npm >/dev/null 2>&1; then
+        die "npm install failed. Install Node.js manually: https://nodejs.org/"
+    fi
+    log "npm: $(command -v npm) ($(npm --version))"
+}
+_ensure_nodejs
 
 # --- 2. re-run detection ------------------------------------------------------
 ETC=/etc/opsbridge/agent
@@ -159,7 +148,7 @@ if [[ "$EXISTING_INSTALL" -eq 1 ]]; then
         CHOICE="k"
     fi
     case "$CHOICE" in
-        k|K) log "keeping existing config — will only refresh venv + sshd snippet" ;;
+        k|K) log "keeping existing config" ;;
         r|R) log "will re-prompt for provider/model/api key" ;;
         a|A) die "aborted" ;;
         *)   log "unknown choice $CHOICE — defaulting to [k]" ; CHOICE="k" ;;
@@ -173,11 +162,8 @@ if [[ -d "$SRC_DIR/.git" ]]; then
     git -C "$SRC_DIR" checkout FETCH_HEAD || git -C "$SRC_DIR" checkout "$REPO_REF" || true
 elif command -v git >/dev/null 2>&1; then
     rm -rf "$SRC_DIR"
-    # `--branch` only accepts branch/tag names, not commit SHAs. Try the
-    # shallow path first; if REPO_REF is a SHA, fall back to a full clone +
-    # checkout.
     if ! git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$SRC_DIR" 2>/dev/null; then
-        log "  (REPO_REF=$REPO_REF not a branch/tag, falling back to full clone + checkout)"
+        log "  (REPO_REF=$REPO_REF not a branch/tag, falling back to full clone)"
         rm -rf "$SRC_DIR"
         git clone "$REPO_URL" "$SRC_DIR"
         git -C "$SRC_DIR" checkout "$REPO_REF"
@@ -191,33 +177,25 @@ else
     mv "$tmp"/*/  "$SRC_DIR"
 fi
 
-# --- 4. bootstrap.sh — venv + admin CLI ---------------------------------------
+# --- 4. bootstrap.sh — Python venv + admin CLI --------------------------------
 log "bootstrap (uv + venv) ..."
 "$SRC_DIR/bootstrap.sh"
 
-# --- 5. interactive prompts (in bash, not Python) -----------------------------
-# Python's getpass.getpass() re-opens /dev/tty with its own quirks that
-# misbehave in nested sudo+pty contexts. We sidestep all of that by gathering
-# config in bash and feeding `opsbridge install` via env vars (the existing
-# non-interactive code path).
+# ---------------------------------------------------------------------------
+# Helper functions for interactive prompts
+# ---------------------------------------------------------------------------
 
-# Read a secret with visible `*` echo per character (instead of `read -s`'s
-# total silence). Supports Backspace (erase one `*`). Result goes into the
-# global REPLY variable, mirroring bash's stock `read`.
+# Read a secret with visible `*` echo per character.
 read_secret_starred() {
     local prompt="$1"
     local secret="" char
     printf '%s' "$prompt"
-    # `IFS=` keeps leading whitespace; -r preserves backslashes; -s suppresses
-    # bash's own echo; -n1 reads ONE char. On Enter, bash strips the \n and
-    # read returns empty, which we treat as end-of-input.
     while IFS= read -r -s -n1 char; do
         if [[ -z "$char" ]]; then
             break
         fi
         case "$char" in
             $'\x7f'|$'\b')
-                # DEL or BS — erase one char from buffer + one `*` from screen.
                 if [[ -n "$secret" ]]; then
                     secret="${secret%?}"
                     printf '\b \b'
@@ -233,76 +211,33 @@ read_secret_starred() {
     REPLY="$secret"
 }
 
-# Auto-correct OPSBRIDGE_BASE_URL when the operator forgot the `/v1` suffix.
-# Most OpenAI-compatible proxies (cliapi, vLLM, litellm-gateway, …) live at
-# `<host>/v1/...`, but the value the operator pastes from a vendor's website
-# often omits it. Probing /models with curl is cheap and discriminates the
-# two layouts: as-given → if 2xx we keep it; otherwise try `<url>/v1/models`
-# and rewrite OPSBRIDGE_BASE_URL on success.
-#
-# We DON'T treat probe failure as fatal — discover_models / check_llm_endpoint
-# will surface the real error later with response body + fix hints.
-normalize_base_url() {
-    local base="${OPSBRIDGE_BASE_URL:-}"
-    [[ -z "$base" ]] && return 0   # vendor default; nothing to normalize
-    local key="$OPSBRIDGE_API_KEY"
-    base="${base%/}"
-
-    # Build candidate layouts to probe in priority order:
-    #   1. as-given                            (respect what the operator typed)
-    #   2. if no /vN suffix → append /v1       (cliapi, vLLM, most OpenAI proxies)
-    #   3. if /vN suffix → strip it            (rare proxy roots at the host)
-    # First /models that returns 2xx wins. If both directions fail, leave
-    # the URL untouched and downstream tools surface the error.
-    local -a candidates=("$base")
-    if [[ "$base" =~ /v[0-9]+$ ]]; then
-        candidates+=("${base%/v*}")
+# Mask a secret for confirmation echo.
+_mask() {
+    local s="$1" n=${#1}
+    if (( n > 8 )); then
+        printf '%s…%s (%d chars)' "${s:0:4}" "${s: -4}" "$n"
     else
-        candidates+=("$base/v1")
+        printf '(%d chars)' "$n"
     fi
-
-    local cand
-    for cand in "${candidates[@]}"; do
-        if curl -fsS -m 8 -o /dev/null -H "Authorization: Bearer $key" "$cand/models" 2>/dev/null; then
-            if [[ "$cand" != "$base" ]]; then
-                log "  base URL auto-corrected: $base → $cand"
-            fi
-            OPSBRIDGE_BASE_URL="$cand"
-            export OPSBRIDGE_BASE_URL
-            return 0
-        fi
-    done
-
-    OPSBRIDGE_BASE_URL="$base"
-    export OPSBRIDGE_BASE_URL
-    return 1
 }
 
-# Query the configured LLM endpoint for its `/v1/models` list. Echoes one
-# model id per line on stdout. Exits non-zero (and produces empty output)
-# if the call fails — caller falls back to typing the name manually.
+# Query the configured LLM for its model list. One model id per line.
 discover_models() {
-    local base="${OPSBRIDGE_BASE_URL:-}"
     local provider="$OPSBRIDGE_PROVIDER"
     local key="$OPSBRIDGE_API_KEY"
 
-    if [[ -z "$base" ]]; then
-        if [[ "$provider" == "openai" ]]; then
-            base="https://api.openai.com/v1"
-        else
-            # Anthropic vendor doesn't expose an OpenAI-style /v1/models that
-            # we'd want to depend on; return a hardcoded short-list instead.
-            printf 'claude-haiku-4-5\nclaude-sonnet-4-6\nclaude-opus-4-7\n'
-            return 0
-        fi
+    if [[ "$provider" == "anthropic" ]]; then
+        # Anthropic doesn't expose a useful /v1/models list; return curated set.
+        printf 'claude-haiku-4-5\nclaude-sonnet-4-6\nclaude-opus-4-7\n'
+        return 0
     fi
-    base="${base%/}"
 
     local resp
-    resp=$(curl -fsS -m 10 -H "Authorization: Bearer $key" "$base/models" 2>/dev/null) || return 1
+    resp=$(curl -fsS -m 10 \
+        -H "Authorization: Bearer $key" \
+        "https://api.openai.com/v1/models" 2>/dev/null) || return 1
     [[ -z "$resp" ]] && return 1
 
-    # Pull model ids out of the JSON. Python is reliable; grep is the fallback.
     if command -v python3 >/dev/null 2>&1; then
         printf '%s' "$resp" | python3 -c '
 import json, sys
@@ -317,13 +252,11 @@ except Exception:
     pass
 '
     else
-        printf '%s' "$resp" | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' | sed 's/.*"\([^"]\+\)".*/\1/'
+        printf '%s' "$resp" | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' | \
+            sed 's/.*"\([^"]\+\)".*/\1/'
     fi
 }
 
-# Pick a default model id from a list based on provider hints. Falls back
-# to the first entry if no hint matches, or to a hardcoded provider default
-# if the list is empty.
 default_model_from_list() {
     local provider="$1"
     local models="$2"
@@ -342,43 +275,33 @@ default_model_from_list() {
     if [[ -z "$pick" ]]; then
         case "$provider" in
             openai)    pick="gpt-4.1-mini" ;;
-            anthropic) pick="claude-sonnet-4-6" ;;
+            anthropic) pick="claude-opus-4-7" ;;
         esac
     fi
     echo "$pick"
 }
 
-# Ask the operator to pick a model, then test it end-to-end with a tiny
-# "hi" round-trip. If the chosen model 4xx's, loop and let them pick another
-# without restarting the install. Discovery-list output is cached across
-# iterations so re-prompting doesn't re-hit /v1/models.
+# Offer a numbered model picker, then verify with a tiny LLM round-trip.
 prompt_for_model() {
     local provider="$OPSBRIDGE_PROVIDER"
     local models default
-    local _ep="${OPSBRIDGE_BASE_URL:-the vendor default endpoint}"
 
-    log "discovering models from $_ep ..."
+    log "discovering models ..."
     models=$(discover_models 2>/dev/null) || true
 
-    # If discovery returned nothing, free-text entry only. Still loop on
-    # round-trip failure so a typo doesn't strand the operator.
     if [[ -z "$models" ]]; then
-        warn "  couldn't fetch /v1/models — type a model id manually."
+        warn "  couldn't fetch model list — type a model id manually."
         case "$provider" in
             openai)    default="gpt-4.1-mini" ;;
-            anthropic) default="claude-sonnet-4-6" ;;
+            anthropic) default="claude-opus-4-7" ;;
         esac
         while :; do
             local model
             read -r -p "Model [$default]: " model
             OPSBRIDGE_MODEL="${model:-$default}"
             export OPSBRIDGE_MODEL
-            if check_llm_endpoint; then
-                return 0
-            fi
-            echo
+            if check_llm_endpoint; then return 0; fi
             warn "Try another model id."
-            echo
         done
     fi
 
@@ -386,13 +309,13 @@ prompt_for_model() {
 
     while :; do
         echo
-        log "Available models (numbered list, recommended starred):"
+        log "Available models (★ = recommended default):"
         local arr=() i=1 m
         while IFS= read -r m; do
             [[ -z "$m" ]] && continue
             arr+=("$m")
             if [[ "$m" == "$default" ]]; then
-                printf '  %2d. %s ★ recommended\n' "$i" "$m"
+                printf '  %2d. %s ★\n' "$i" "$m"
             else
                 printf '  %2d. %s\n' "$i" "$m"
             fi
@@ -411,24 +334,17 @@ prompt_for_model() {
         fi
         export OPSBRIDGE_MODEL
         echo "  selected: $OPSBRIDGE_MODEL"
-
-        # Tiny round-trip with the selected model. If it works we're done;
-        # if not, fall through to re-pick.
-        if check_llm_endpoint; then
-            return 0
-        fi
-        echo
+        if check_llm_endpoint; then return 0; fi
         warn "Pick a different model (or paste an id)."
     done
 }
 
 prompt_for_config() {
     echo
-    log "Configure LLM"
+    log "Configure model"
 
-    local provider base_url jina_key
+    local provider
 
-    # 1. Provider — drives default base URL + model-list discovery path.
     while :; do
         read -r -p "Provider [anthropic/openai] [anthropic]: " provider
         provider=${provider:-anthropic}
@@ -439,15 +355,6 @@ prompt_for_config() {
     done
     export OPSBRIDGE_PROVIDER="$provider"
 
-    # 2. Base URL — optional, empty = vendor's official endpoint. We probe
-    # /models below to auto-append /v1 if the operator forgot it.
-    read -r -p "Custom base URL (empty = official; include /v1 if your proxy uses it): " base_url
-    export OPSBRIDGE_BASE_URL="$base_url"
-
-    # 3. API key — required, hidden with per-char `*` echo so the operator
-    # sees their keystrokes land. After Enter we ALSO show a masked summary
-    # of the captured value, since the file it'll land in is separate from
-    # config.toml and a silent capture invites "did it even save?".
     while :; do
         read_secret_starred "Paste API key: "
         if [[ -z "$REPLY" ]]; then
@@ -455,38 +362,11 @@ prompt_for_config() {
             continue
         fi
         export OPSBRIDGE_API_KEY="$REPLY"
-        echo "  captured: $(_mask "$OPSBRIDGE_API_KEY")  → /etc/opsbridge/agent/api.key (mode 0400, owned by agent)"
+        echo "  captured: $(_mask "$OPSBRIDGE_API_KEY")  → /etc/opsbridge/agent/api.key"
         break
     done
 
-    # 3b. Normalize base URL — common operator typo: omitting `/v1`. Probe
-    # the as-given URL first; if /models 404s but /v1/models works, silently
-    # auto-correct (with a visible log line) so downstream steps don't
-    # cascade-fail. Skipped when no base URL was provided (vendor default).
-    normalize_base_url || true
-
-    # 4. Model — now that we have URL + key (and a corrected URL if the
-    # operator forgot /v1), query /models and offer a numbered pick.
     prompt_for_model
-
-    # 5. Jina key — optional, hidden, also with `*` echo.
-    read_secret_starred "Jina API key for 'visit' (empty = skip): "
-    export OPSBRIDGE_JINA_API_KEY="$REPLY"
-    if [[ -n "$OPSBRIDGE_JINA_API_KEY" ]]; then
-        echo "  captured: $(_mask "$OPSBRIDGE_JINA_API_KEY")  → /etc/opsbridge/agent/config.toml [visit]"
-    fi
-}
-
-# Mask a secret for confirmation echo. Shows `aaaa…zzzz (N chars)` for
-# secrets >8 chars long, `(N chars)` otherwise. Length is informative; the
-# 4-char head/tail lets the operator visually spot a copy/paste truncation.
-_mask() {
-    local s="$1" n=${#1}
-    if (( n > 8 )); then
-        printf '%s…%s (%d chars)' "${s:0:4}" "${s: -4}" "$n"
-    else
-        printf '(%d chars)' "$n"
-    fi
 }
 
 show_config_review() {
@@ -494,40 +374,31 @@ show_config_review() {
     log "Configured (review before applying):"
     printf '  %-12s : %s\n' "provider" "$OPSBRIDGE_PROVIDER"
     printf '  %-12s : %s\n' "model"    "$OPSBRIDGE_MODEL"
-    printf '  %-12s : %s\n' "base url" "${OPSBRIDGE_BASE_URL:-(vendor default)}"
     printf '  %-12s : %s\n' "API key"  "$(_mask "$OPSBRIDGE_API_KEY")"
-    printf '  %-12s : %s\n' "Jina key" "${OPSBRIDGE_JINA_API_KEY:+$(_mask "$OPSBRIDGE_JINA_API_KEY")}${OPSBRIDGE_JINA_API_KEY:-(skipped — 20 RPM unauthenticated)}"
     printf '  %-12s : %s\n' "pubkey"   "${OPSBRIDGE_PUBKEY:-(skipped — add manually later)}"
     echo
 }
 
-# Verify the LLM endpoint with a tiny round-trip BEFORE writing config files.
-# Cheaper to catch a bad model/URL/key now than during the operator's first
-# real TUI turn. Honors OPSBRIDGE_SKIP_LLM_CHECK=1 for offline/CI installs.
 check_llm_endpoint() {
     [[ "${OPSBRIDGE_SKIP_LLM_CHECK:-0}" == "1" ]] && return 0
 
-    local base="$OPSBRIDGE_BASE_URL" provider="$OPSBRIDGE_PROVIDER"
-    local model="$OPSBRIDGE_MODEL" key="$OPSBRIDGE_API_KEY"
+    local provider="$OPSBRIDGE_PROVIDER"
+    local model="$OPSBRIDGE_MODEL"
+    local key="$OPSBRIDGE_API_KEY"
     local body http url
     body=$(mktemp)
 
-    # When base_url is set, our model.py routes everything via the OpenAI
-    # client (LiteLLM uses "openai/" prefix). So `/chat/completions` works
-    # regardless of which vendor the proxy is fronting.
-    if [[ -n "$base" ]] || [[ "$provider" == "openai" ]]; then
-        url="${base:-https://api.openai.com/v1}"
-        url="${url%/}/chat/completions"
-        log "verifying LLM endpoint: $url (model=$model) ..."
+    if [[ "$provider" == "openai" ]]; then
+        url="https://api.openai.com/v1/chat/completions"
+        log "verifying endpoint: $url (model=$model) ..."
         http=$(curl -sS -o "$body" -w "%{http_code}" -m 15 \
             -H "Authorization: Bearer $key" \
             -H "Content-Type: application/json" \
             -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"ok\"}],\"max_tokens\":4}" \
             "$url" 2>/dev/null || echo "000")
     else
-        # Vendor-native Anthropic: x-api-key header, /v1/messages endpoint.
         url="https://api.anthropic.com/v1/messages"
-        log "verifying LLM endpoint: $url (model=$model) ..."
+        log "verifying endpoint: $url (model=$model) ..."
         http=$(curl -sS -o "$body" -w "%{http_code}" -m 15 \
             -H "x-api-key: $key" \
             -H "anthropic-version: 2023-06-01" \
@@ -537,20 +408,14 @@ check_llm_endpoint() {
     fi
 
     if [[ "$http" == "200" ]]; then
-        log "  ok (HTTP 200) — endpoint reachable, model recognized"
+        log "  ok (HTTP 200) — model recognized"
         rm -f "$body"
         return 0
     fi
 
     warn "LLM endpoint check failed: HTTP $http"
-    echo "Response body:" >&2
     head -c 600 "$body" >&2
     echo >&2
-    echo >&2
-    echo "Common fixes:" >&2
-    echo "  - base URL usually needs the /v1 suffix (e.g. https://your.proxy/v1)" >&2
-    echo "  - verify model name with: curl ${url%/chat/completions}/models -H 'Authorization: Bearer YOUR_KEY' | head" >&2
-    echo "  - confirm API key isn't typo'd or revoked" >&2
     rm -f "$body"
     return 1
 }
@@ -565,8 +430,7 @@ prompt_for_pubkey() {
     [[ -n "$pubkey" ]] && export OPSBRIDGE_PUBKEY="$pubkey"
 }
 
-# Skip interactive prompts when re-running with [k]eep, or when env vars
-# already cover the config, or in non-TTY environments.
+# --- 5. interactive prompts ---------------------------------------------------
 NEEDS_PROMPT=1
 if [[ "$EXISTING_INSTALL" -eq 1 && "$CHOICE" =~ ^[kK]$ ]]; then
     NEEDS_PROMPT=0
@@ -579,19 +443,14 @@ if [[ "$SUPPORTS_TTY" -eq 0 && -z "${OPSBRIDGE_API_KEY:-}" ]]; then
     die "no TTY and no OPSBRIDGE_API_KEY — set env vars (see install.sh header) or run with a TTY"
 fi
 if [[ "$NEEDS_PROMPT" -eq 1 ]]; then
-    # Interactive: prompt_for_model already runs check_llm_endpoint in
-    # a loop, so by the time we get past prompt_for_config we know the
-    # provider/url/key/model combination actually accepts a hello.
     prompt_for_config
     show_config_review
     prompt_for_pubkey
 elif [[ -n "${OPSBRIDGE_API_KEY:-}" ]]; then
-    # Env-var mode: probe once, surface failure prominently but proceed
-    # (CI / Ansible has no human to re-prompt).
     show_config_review
     if ! check_llm_endpoint; then
-        warn "Continuing despite the failed probe (env-var mode). Fix later with:"
-        warn "    sudo opsbridge config && sudo opsbridge doctor --check-api"
+        warn "Continuing despite failed probe (env-var mode). Fix later with:"
+        warn "    sudo opsbridge config"
     fi
 fi
 
@@ -608,5 +467,6 @@ log "running: opsbridge install ${ARGS[*]:-(no args)}"
 
 log "done."
 log "  config + api.key  → /etc/opsbridge/agent/"
-log "  audit logs        → /var/log/opsbridge/agent/"
+log "  system prompt     → /home/agent/.pi/agent/SYSTEM.md"
+log "  launcher script   → /usr/local/bin/opsbridge-agent"
 log "next: ssh agent@\$(hostname)"
