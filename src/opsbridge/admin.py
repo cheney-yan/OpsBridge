@@ -243,7 +243,7 @@ def _install_pi() -> None:
             "npm not found — install Node.js first (https://nodejs.org/)"
         )
     subprocess.run(
-        [npm, "install", "-g", "--ignore-scripts", "@earendil-works/pi-coding-agent"],
+        [npm, "install", "-g", "--ignore-scripts", "@mariozechner/pi-coding-agent"],
         check=True,
     )
 
@@ -857,7 +857,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     def _pi_check():
         pi_path = shutil.which("pi")
         if pi_path is None:
-            return False, "pi not found — run: npm install -g --ignore-scripts @earendil-works/pi-coding-agent"
+            return False, "pi not found — run: npm install -g --ignore-scripts @mariozechner/pi-coding-agent"
         return True, pi_path
 
     def _authkeys():

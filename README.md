@@ -1,64 +1,63 @@
 # OpsBridge
 
-SSH into a server and land in an AI sysadmin TUI instead of a shell.
+SSH into a server and land in an AI sysadmin session instead of a shell.
 
 ```
 $ ssh agent@my-server
-                                                                ┌──────────┐
-                                                                │OpsBridge │
-                                                                └──────────┘
-> install nginx
-[search] "nginx install ubuntu" → 5 results
-[visit] https://nginx.org/en/docs/install.html
-$ apt-get update && apt-get install -y nginx
-…
-▶ Run `sudo apt install nginx -y`? Downloads ~150 MB.
-    ( ) yes
-    (•) no  ← default
+
+  ┌─ pi ──────────────────────────────────────────────────────────────┐
+  │ > install nginx                                                    │
+  │                                                                    │
+  │ I'll install nginx using apt.                                      │
+  │ $ sudo apt-get update && sudo apt-get install -y nginx             │
+  │ ...                                                                │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
-OpsBridge is a per-session agent daemon. `sshd` matches the `agent` user
-and replaces their login shell with a smolagents `CodeAgent` running in a
-full-screen [textual](https://textual.textualize.io/) TUI. The agent uses
-an LLM (OpenAI or Anthropic, configurable) and seven tools — `read`,
-`write`, `bash`, `search`, `visit`, `ask`, `remember` — to translate
-English requests into shell actions on the host.
+OpsBridge wires SSH into [pi.dev](https://github.com/badlogic/pi-mono) — a
+fully-featured terminal AI agent. `sshd` matches the `agent` user and runs a
+generated launcher script instead of a shell:
+
+```
+SSH → ForceCommand → /usr/local/bin/opsbridge-agent
+                           └── exec pi --model "anthropic/claude-opus-4-7"
+                                  ↑ reads ~/.pi/agent/SYSTEM.md (safety rules)
+                                  ↑ reads ~/.pi/agent/auth.json (API key)
+```
+
+Pi.dev handles the TUI, tools (read / write / bash / edit / grep / find / ls),
+and LLM calls. OpsBridge's role is SSH glue, system prompt injection, and the
+admin CLI.
 
 ## Install
-
-The one-liner installer creates the `agent` system user, NOPASSWD sudoers
-entry, sshd `ForceCommand` snippet, and prompts for an LLM API key and an
-authorized SSH pubkey.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/main/install.sh | bash
 ```
 
-Pin a specific commit, branch, or tag — pass it as both the URL path
-and to `bash -s`:
+> **No leading `sudo`** — the installer handles privilege escalation itself so
+> its `sudo` attaches to your real terminal. `curl | sudo bash` silently breaks
+> interactive prompts.
+
+Pin a specific tag:
 
 ```bash
-REF=v0.3.0 && \
+REF=v0.4.3 && \
 curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/$REF/install.sh \
   | bash -s $REF
 ```
 
-> **Note**: no leading `sudo`. The installer handles privilege escalation
-> itself so its `sudo` invocation is connected to your actual terminal —
-> avoiding the broken-pty trap where `curl | sudo bash` silently fails on
-> interactive prompts.
-
-For unattended installs (CI / Ansible), set env vars to skip prompts:
+Unattended / CI:
 
 ```bash
-OPSBRIDGE_PROVIDER=openai \
-OPSBRIDGE_MODEL=gpt-4.1-mini \
+OPSBRIDGE_PROVIDER=anthropic \
+OPSBRIDGE_MODEL=claude-opus-4-7 \
 OPSBRIDGE_API_KEY=... \
 OPSBRIDGE_PUBKEY="ssh-ed25519 AAAA... me@laptop" \
-curl -fsSL .../install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/main/install.sh | bash
 ```
 
-Supported platforms: Linux + systemd, macOS + launchd. BSD deferred.
+Supported: Linux + systemd, macOS + launchd.
 
 ## Use
 
@@ -66,119 +65,61 @@ Supported platforms: Linux + systemd, macOS + launchd. BSD deferred.
 ssh agent@your-server
 ```
 
-You'll land in the TUI (four regions: scrollable top region, middle for
-the final answer or a confirmation form, status bar, input line). Type
-requests in English. Ctrl-D leaves. Destructive commands trigger a form
-prompt — Y/N + Enter.
-
-## Try it locally (no install)
-
-If you just want to kick the tyres against the test LLM proxy without
-running the installer:
-
-```bash
-git clone https://github.com/cheney-yan/OpsBridge.git
-cd OpsBridge
-uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python -e '.[dev]'
-# Point at your own LLM proxy or vendor endpoint and key.
-cat > .env <<EOF
-AGENT_TEST_LLM_BASE_URL=https://your-openai-compatible-proxy.example.com
-AGENT_TEST_LLM_KEY=your-api-key-here
-EOF
-.venv/bin/python run-demo.py
-```
-
-`run-demo.py` runs the full TUI against the configured proxy. State
-lives in `/tmp/opsbridge-demo/` (preferences, audit JSONL).
-
-For a quick non-TUI smoke (e.g. on CI):
-
-```bash
-.venv/bin/python run-demo.py --one-shot "what's my pwd?"
-```
+Pi.dev's TUI launches. Type requests in English. Use Ctrl-C to interrupt a
+running command, Ctrl-D to exit.
 
 ## Tools
 
-| Tool | Why |
+Pi.dev's built-in tools — no custom Python required:
+
+| Tool | What it does |
 |---|---|
-| `read` | Paginated, line-numbered file reads. |
-| `write` | Atomic file write. Parent dir must exist. |
-| `bash` | `bash -lc` (login shell, sources `.profile`). 60s default timeout. Live output streams to the top region. |
-| `search` | Web search via smolagents `WebSearchTool`. No API key. |
-| `visit` | Fetch one URL via [Jina Reader](https://jina.ai/reader) (handles JS / bot-detection server-side). Optional API key for higher RPM. |
-| `ask` | Structured confirmation form (radio buttons). Used before any destructive action — replaces fragile `[y/N]` text matching. |
-| `remember` | Sole audit chokepoint for `/etc/opsbridge/agent/preferences.md`. Enforces 50-line / 4 KB cap and rejects duplicates. |
+| `read` | Read a file |
+| `write` | Write / overwrite a file |
+| `bash` | Run shell commands with live output |
+| `edit` | Apply a targeted diff to a file |
+| `grep` | Search file contents |
+| `find` | Find files by name or pattern |
+| `ls` | List directory contents |
 
 ## Admin CLI
 
-After install, an `opsbridge` console script is symlinked into
-`/usr/local/bin`:
-
 ```bash
-opsbridge install            # idempotent; re-run after `git pull`
-opsbridge install --interactive   # prompts for provider/model/key/pubkey
-opsbridge config             # rotate API key / switch provider
+opsbridge install            # idempotent; re-run after git pull
+opsbridge install --reconfigure   # re-prompt for provider/model/key
+opsbridge config             # rotate API key / switch provider or model
 opsbridge doctor             # verify install integrity
-opsbridge doctor --check-api          # also ping the LLM
-opsbridge doctor --system-prompt      # validate override anchors
-opsbridge enable / disable   # toggle the sshd ForceCommand
-opsbridge audit preferences  # canonical + suspicious timelines
+opsbridge enable / disable   # toggle the sshd ForceCommand snippet
 opsbridge uninstall          # remove user, sudoers, sshd snippet
 ```
 
-## Per-host configuration
+## Configuration
 
-The agent reads two files at startup:
+`opsbridge install` / `opsbridge config` write three pi.dev config files under
+`~agent/.pi/agent/` and the opsbridge config under `/etc/opsbridge/agent/`:
 
-- `/etc/opsbridge/agent/config.toml` — provider, model, optional
-  `base_url`, optional `[visit]` block (`jina_api_key`, `timeout_sec`,
-  `max_bytes`).
-- `/etc/opsbridge/agent/api.key` — LLM API token. Mode 0400.
+| File | Purpose |
+|---|---|
+| `/etc/opsbridge/agent/config.toml` | provider, default model, optional base\_url, model list with context windows |
+| `/etc/opsbridge/agent/api.key` | LLM API token (mode 0400, read by auth.json shell command) |
+| `~agent/.pi/agent/auth.json` | Pi.dev credential — `"!cat /etc/opsbridge/agent/api.key"` |
+| `~agent/.pi/agent/models.json` | Pi.dev model metadata (context window, max tokens, optional base URL) |
+| `~agent/.pi/agent/SYSTEM.md` | Safety rules injected as system prompt every session |
 
-The default system prompt ships in the venv at
-`opsbridge/agent/prompts/system.md`. To override per-host, write to
-`/etc/opsbridge/agent/system_prompt.md`; the override is loaded only if
-it contains every required safety anchor (`## Hard rules`,
-`ask before destructive`, `preferences file is special`,
-`never fabricate tool output`, `NOPASSWD sudo`). `opsbridge doctor
---system-prompt` verifies this.
-
-Operator preferences (`/etc/opsbridge/agent/preferences.md`) persist
-across sessions. Mutate only via the `remember` tool — `write` / `bash`
-against this path is treated as a security bypass and surfaces in
-`opsbridge audit preferences --suspicious`.
+**Custom provider / Azure / Bedrock:** set `base_url` during `opsbridge config`
+and the installer writes a `models.json` `baseUrl` override for pi.dev.
 
 ## Security model
 
-- **Trust boundary:** an SSH key authorized for the `agent` user is
-  equivalent to root on the host. NOPASSWD sudo is intentional — there's
-  no second authorization layer inside the TUI.
-- **Soft guardrail:** the system prompt instructs the LLM to call the
-  `ask` tool before any destructive or shared-state-affecting command.
-  The `ask_pre_exec` event in the audit log captures the LLM's intent
-  before the operator's response.
-- **Audit log:** one JSONL file per session at
-  `/var/log/opsbridge/agent/<session-id>.jsonl`. Includes
-  `session_start`, `system_prompt_source` (with sha256),
-  `bash_pre_exec`, `search_pre_exec`, `visit_pre_exec`, `ask_pre_exec`,
-  `tool_call`, `turn_start`/`turn_end`, `session_end`.
-- **ANSI sanitization:** all tool output passes through a one-shot
-  sanitizer that keeps SGR (colors) and strips CSI cursor / screen
-  control / OSC / ESC singles — defeats prompt-injection attempts at
-  terminal title hijacking or rolling-window smashing.
-
-## Project status
-
-| Phase | Scope | Status |
-|---|---|---|
-| 1 | Four tools, REPL TUI, token budget, admin CLI, sudoers/sshd wiring | ✅ |
-| 2 | Full-screen textual TUI, `search`/`visit`/`ask` tools, prompt externalization, `install.sh`, macOS support | ✅ — 111 tests pass |
-
-See [PRD.md](PRD.md) (Phase 1 spec) and [PRD-phase2.md](PRD-phase2.md)
-(Phase 2 spec) for the full design rationale. [CLAUDE.md](CLAUDE.md)
-holds the locked-in decisions that should be re-litigated only with
-explicit user buy-in.
+- **Trust boundary:** an SSH key authorized for the `agent` user is equivalent
+  to root on the host. NOPASSWD sudo is intentional — there is no second
+  authorization layer inside the session.
+- **Soft guardrail:** the system prompt (`~agent/.pi/agent/SYSTEM.md`) instructs
+  the model to confirm before destructive commands (`rm`, `drop`, `kill`,
+  overwrite). This is the only confirmation mechanism.
+- **API key at rest:** stored mode 0400 at `/etc/opsbridge/agent/api.key`,
+  read at runtime by pi.dev via the `!cat` shell command in `auth.json`. Never
+  exported into the process environment.
 
 ## Uninstall
 
@@ -186,12 +127,9 @@ explicit user buy-in.
 sudo opsbridge uninstall
 ```
 
-Removes the `agent` user, `/opt/opsbridge/`, `/etc/opsbridge/`, sudoers
-file, sshd snippet, and the `opsbridge` symlink. Logs at
-`/var/log/opsbridge/agent/` are kept — remove them separately if
-desired.
-
+Removes the `agent` user, `/opt/opsbridge/`, `/etc/opsbridge/`, sudoers file,
+sshd snippet, launcher script, and the `opsbridge` symlink.
 
 ## License
 
-MIT. See [PRD.md](PRD.md) for design lineage and rationale.
+MIT.
