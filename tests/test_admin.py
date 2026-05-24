@@ -1,7 +1,8 @@
-"""Admin CLI tests — argument parsing, doctor helpers, launcher generation."""
+"""Admin CLI tests — argument parsing, doctor helpers, launcher and pi.dev config generation."""
 from __future__ import annotations
 
 import argparse
+import json
 import pytest
 
 from opsbridge import admin
@@ -98,30 +99,100 @@ def test_ensure_shell_launcher_idempotent(tmp_path, monkeypatch):
     assert text.count(admin._AGENT_LAUNCHER_HEAD) == 1
 
 
+# ---------------------------------------------------------------------------
+# Launcher script
+# ---------------------------------------------------------------------------
+
 def test_launcher_script_anthropic():
-    """Launcher for anthropic provider uses ANTHROPIC_API_KEY and correct model prefix."""
     script = admin._launcher_script("anthropic", "claude-opus-4-7")
-    assert "ANTHROPIC_API_KEY" in script
     assert 'exec pi --model "anthropic/claude-opus-4-7"' in script
-    assert "OPENAI_API_KEY" not in script
 
 
 def test_launcher_script_openai():
-    """Launcher for openai provider uses OPENAI_API_KEY and correct model prefix."""
     script = admin._launcher_script("openai", "gpt-4o")
-    assert "OPENAI_API_KEY" in script
     assert 'exec pi --model "openai/gpt-4o"' in script
-    assert "ANTHROPIC_API_KEY" not in script
 
 
 def test_launcher_script_tty_guard():
-    """Launcher must exit 2 when stdin is not a TTY."""
     script = admin._launcher_script("anthropic", "claude-sonnet-4-5")
     assert "[ -t 0 ]" in script
     assert "exit 2" in script
 
 
-def test_launcher_script_reads_api_key_from_file():
-    """API key must come from /etc/opsbridge/agent/api.key at runtime, not hardcoded."""
+def test_launcher_script_no_hardcoded_credentials():
+    """Launcher must NOT contain API keys or env var exports — auth.json handles that."""
     script = admin._launcher_script("anthropic", "claude-opus-4-7")
-    assert "$(cat /etc/opsbridge/agent/api.key)" in script
+    assert "API_KEY" not in script
+    assert "export" not in script
+    assert "api.key" not in script
+
+
+# ---------------------------------------------------------------------------
+# Pi.dev auth.json
+# ---------------------------------------------------------------------------
+
+def test_write_pi_auth_anthropic(tmp_path, monkeypatch):
+    monkeypatch.setattr(admin, "PI_AUTH_JSON", tmp_path / "auth.json")
+    monkeypatch.setattr(admin.shutil, "chown", lambda *a, **kw: None)
+    admin._write_pi_auth({"provider": "anthropic"})
+    data = json.loads((tmp_path / "auth.json").read_text())
+    assert "anthropic" in data
+    assert data["anthropic"]["type"] == "api_key"
+    assert data["anthropic"]["key"] == "!cat /etc/opsbridge/agent/api.key"
+
+
+def test_write_pi_auth_openai(tmp_path, monkeypatch):
+    monkeypatch.setattr(admin, "PI_AUTH_JSON", tmp_path / "auth.json")
+    monkeypatch.setattr(admin.shutil, "chown", lambda *a, **kw: None)
+    admin._write_pi_auth({"provider": "openai"})
+    data = json.loads((tmp_path / "auth.json").read_text())
+    assert "openai" in data
+    assert data["openai"]["key"] == "!cat /etc/opsbridge/agent/api.key"
+
+
+# ---------------------------------------------------------------------------
+# Pi.dev models.json (custom base URL)
+# ---------------------------------------------------------------------------
+
+def test_write_pi_models_with_base_url(tmp_path, monkeypatch):
+    models_path = tmp_path / "models.json"
+    monkeypatch.setattr(admin, "PI_MODELS_JSON", models_path)
+    monkeypatch.setattr(admin.shutil, "chown", lambda *a, **kw: None)
+    admin._write_pi_models({
+        "provider": "openai",
+        "base_url": "https://my.proxy.example/v1",
+    })
+    data = json.loads(models_path.read_text())
+    assert data["providers"]["openai"]["baseUrl"] == "https://my.proxy.example/v1"
+    assert data["providers"]["openai"]["api"] == "openai-completions"
+
+
+def test_write_pi_models_anthropic_custom(tmp_path, monkeypatch):
+    models_path = tmp_path / "models.json"
+    monkeypatch.setattr(admin, "PI_MODELS_JSON", models_path)
+    monkeypatch.setattr(admin.shutil, "chown", lambda *a, **kw: None)
+    admin._write_pi_models({
+        "provider": "anthropic",
+        "base_url": "https://bedrock.proxy/v1",
+    })
+    data = json.loads(models_path.read_text())
+    assert data["providers"]["anthropic"]["api"] == "anthropic-messages"
+
+
+def test_write_pi_models_no_base_url_removes_file(tmp_path, monkeypatch):
+    """When base_url is empty, models.json should be deleted if it exists."""
+    models_path = tmp_path / "models.json"
+    models_path.write_text('{"providers":{}}')
+    monkeypatch.setattr(admin, "PI_MODELS_JSON", models_path)
+    monkeypatch.setattr(admin.shutil, "chown", lambda *a, **kw: None)
+    admin._write_pi_models({"provider": "anthropic", "base_url": ""})
+    assert not models_path.exists()
+
+
+def test_write_pi_models_no_base_url_no_file(tmp_path, monkeypatch):
+    """When base_url is empty and no file exists, no file should be created."""
+    models_path = tmp_path / "models.json"
+    monkeypatch.setattr(admin, "PI_MODELS_JSON", models_path)
+    monkeypatch.setattr(admin.shutil, "chown", lambda *a, **kw: None)
+    admin._write_pi_models({"provider": "anthropic", "base_url": ""})
+    assert not models_path.exists()

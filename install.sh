@@ -24,7 +24,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Step 0: get the script onto disk + re-exec as root with a real TTY.
 # ---------------------------------------------------------------------------
-_OB_ENV_KEEP=OPSBRIDGE_PROVIDER,OPSBRIDGE_MODEL,OPSBRIDGE_API_KEY,OPSBRIDGE_PUBKEY,OPSBRIDGE_REPO_URL,OPSBRIDGE_REPO_REF,OPSBRIDGE_SRC_DIR,OPSBRIDGE_USE_SYSTEM_PYTHON,OPSBRIDGE_SKIP_LLM_CHECK
+_OB_ENV_KEEP=OPSBRIDGE_PROVIDER,OPSBRIDGE_MODEL,OPSBRIDGE_BASE_URL,OPSBRIDGE_API_KEY,OPSBRIDGE_PUBKEY,OPSBRIDGE_REPO_URL,OPSBRIDGE_REPO_REF,OPSBRIDGE_SRC_DIR,OPSBRIDGE_USE_SYSTEM_PYTHON,OPSBRIDGE_SKIP_LLM_CHECK
 
 if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
     _tmp=$(mktemp /tmp/opsbridge-install.XXXXXX.sh)
@@ -355,6 +355,10 @@ prompt_for_config() {
     done
     export OPSBRIDGE_PROVIDER="$provider"
 
+    local base_url
+    read -r -p "Custom base URL (empty = official endpoint): " base_url
+    export OPSBRIDGE_BASE_URL="${base_url:-}"
+
     while :; do
         read_secret_starred "Paste API key: "
         if [[ -z "$REPLY" ]]; then
@@ -374,6 +378,7 @@ show_config_review() {
     log "Configured (review before applying):"
     printf '  %-12s : %s\n' "provider" "$OPSBRIDGE_PROVIDER"
     printf '  %-12s : %s\n' "model"    "$OPSBRIDGE_MODEL"
+    printf '  %-12s : %s\n' "base url" "${OPSBRIDGE_BASE_URL:-(vendor default)}"
     printf '  %-12s : %s\n' "API key"  "$(_mask "$OPSBRIDGE_API_KEY")"
     printf '  %-12s : %s\n' "pubkey"   "${OPSBRIDGE_PUBKEY:-(skipped — add manually later)}"
     echo
@@ -385,11 +390,13 @@ check_llm_endpoint() {
     local provider="$OPSBRIDGE_PROVIDER"
     local model="$OPSBRIDGE_MODEL"
     local key="$OPSBRIDGE_API_KEY"
+    local base="${OPSBRIDGE_BASE_URL:-}"
     local body http url
     body=$(mktemp)
 
-    if [[ "$provider" == "openai" ]]; then
-        url="https://api.openai.com/v1/chat/completions"
+    if [[ "$provider" == "openai" || -n "$base" ]]; then
+        url="${base:-https://api.openai.com/v1}"
+        url="${url%/}/chat/completions"
         log "verifying endpoint: $url (model=$model) ..."
         http=$(curl -sS -o "$body" -w "%{http_code}" -m 15 \
             -H "Authorization: Bearer $key" \
