@@ -514,22 +514,11 @@ def _parse_model_selection(raw: str, max_idx: int) -> list[int]:
 
 
 def _lookup_or_prompt_model_meta(model_id: str) -> dict:
-    """Return {id, contextWindow, maxTokens} — look up KNOWN_MODELS or prompt."""
+    """Return {id, contextWindow, maxTokens} — look up KNOWN_MODELS or use defaults."""
     meta = KNOWN_MODELS.get(model_id)
     if meta:
         return {"id": model_id, **meta}
-    print(f"  '{model_id}' not in local registry — enter token limits.")
-    ctx_raw = _prompt("  Context window (tokens)", default="128000")
-    max_raw = _prompt("  Max output tokens", default="4096")
-    try:
-        ctx = int(ctx_raw.replace(",", "").replace("_", ""))
-    except ValueError:
-        ctx = 128_000
-    try:
-        max_tok = int(max_raw.replace(",", "").replace("_", ""))
-    except ValueError:
-        max_tok = 4_096
-    return {"id": model_id, "contextWindow": ctx, "maxTokens": max_tok}
+    return {"id": model_id, "contextWindow": 128_000, "maxTokens": 4_096}
 
 
 def _prompt_default_model(selected_ids: list[str], existing_default: str) -> str:

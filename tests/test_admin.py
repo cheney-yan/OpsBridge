@@ -299,18 +299,11 @@ def test_lookup_or_prompt_model_meta_known():
     assert result == {"id": "claude-opus-4-7", "contextWindow": 200_000, "maxTokens": 32_000}
 
 
-def test_lookup_or_prompt_model_meta_unknown(monkeypatch):
-    calls: list[str] = []
-
-    def fake_input(prompt: str) -> str:
-        calls.append(prompt)
-        return "200000" if len(calls) == 1 else "8192"
-
-    monkeypatch.setattr("builtins.input", fake_input)
+def test_lookup_or_prompt_model_meta_unknown():
     result = admin._lookup_or_prompt_model_meta("my-custom-model-v99")
     assert result["id"] == "my-custom-model-v99"
-    assert result["contextWindow"] == 200_000
-    assert result["maxTokens"] == 8_192
+    assert result["contextWindow"] == 128_000
+    assert result["maxTokens"] == 4_096
 
 
 # ---------------------------------------------------------------------------
