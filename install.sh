@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # OpsBridge one-liner installer.
 #
-# Install (latest):
-#     curl -fsSL .../install.sh | bash
+# Usage (the -s -- is bash plumbing to pass args through a pipe):
 #
-# Install specific version:
-#     curl -fsSL .../install.sh | bash -s -- -v v0.4.6
-#
-# Uninstall:
-#     curl -fsSL .../install.sh | bash -s -- uninstall
+#   Install latest:          curl -fsSL .../install.sh | bash
+#   Install:                 curl -fsSL .../install.sh | bash -s -- install
+#   Install version:         curl -fsSL .../install.sh | bash -s -- install -v v0.4.8
+#   Uninstall:               curl -fsSL .../install.sh | bash -s -- uninstall
+#   Version then uninstall:  curl -fsSL .../install.sh | bash -s -- -v v0.4.8 uninstall
 #
 # Non-interactive (CI / Ansible):
 #     OPSBRIDGE_PROVIDER=anthropic \
@@ -16,9 +15,6 @@
 #     OPSBRIDGE_API_KEY=... \
 #     OPSBRIDGE_PUBKEY="ssh-ed25519 AAAA... me@host" \
 #     curl -fsSL .../install.sh | bash
-#
-# Why -s --: bash reads the script from the pipe (stdin); -s -- tells it
-# to pass the remaining words as $1, $2, ... to the script.
 #
 # Why no leading sudo: `curl | sudo bash` is fundamentally broken for
 # interactive prompts. This script handles sudo internally so its sudo
@@ -62,11 +58,36 @@ fi
 # Past this point: root, running from a real file, fd 0 attached to TTY
 # (or /dev/null in env-var mode).
 
+log()   { printf '\033[1;36m[install]\033[0m %s\n' "$*"; }
+warn()  { printf '\033[1;33m[install]\033[0m %s\n' "$*" >&2; }
+die()   { printf '\033[1;31m[install]\033[0m %s\n' "$*" >&2; exit 1; }
+
+REPO_URL="${OPSBRIDGE_REPO_URL:-https://github.com/cheney-yan/OpsBridge.git}"
+REPO_REF="${OPSBRIDGE_REPO_REF:-main}"
+SRC_DIR="${OPSBRIDGE_SRC_DIR:-/opt/opsbridge-src}"
+SUPPORTS_TTY=0
+[[ -t 0 ]] && SUPPORTS_TTY=1
+SUBCMD="install"
+
 # ---------------------------------------------------------------------------
-# Uninstall mode: bash install.sh uninstall  OR  curl ... | bash -s uninstall
+# Argument parsing — flags and subcommand accepted in any order:
+#   install [-v <version>]   (default)
+#   uninstall [-v <version>]
 # ---------------------------------------------------------------------------
-if [[ "${1:-}" == "uninstall" ]]; then
-    printf '\033[1;36m[install]\033[0m %s\n' "Uninstalling OpsBridge..."
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        install)    SUBCMD="install";  shift ;;
+        uninstall)  SUBCMD="uninstall"; shift ;;
+        -v)         REPO_REF="${2:?"-v requires a version, e.g.: -v v0.4.7"}"; shift 2 ;;
+        *)          die "unknown argument: $1  (usage: [install|uninstall] [-v <version>])" ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Uninstall
+# ---------------------------------------------------------------------------
+if [[ "$SUBCMD" == "uninstall" ]]; then
+    log "Uninstalling OpsBridge..."
     if command -v opsbridge >/dev/null 2>&1; then
         opsbridge uninstall --yes
     else
@@ -77,13 +98,13 @@ if [[ "${1:-}" == "uninstall" ]]; then
                   /usr/local/bin/opsbridge-agent; do
             if [[ -e "$f" || -L "$f" ]]; then
                 rm -f "$f"
-                printf '\033[1;36m[install]\033[0m  removed %s\n' "$f"
+                log "  removed $f"
             fi
         done
         rm -rf /opt/opsbridge /etc/opsbridge
         if id agent >/dev/null 2>&1; then
             userdel -r agent 2>/dev/null || true
-            printf '\033[1;36m[install]\033[0m  removed user agent\n'
+            log "  removed user agent"
         fi
         if command -v systemctl >/dev/null 2>&1; then
             systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
@@ -92,29 +113,10 @@ if [[ "${1:-}" == "uninstall" ]]; then
         fi
     fi
     rm -rf /opt/opsbridge-src
-    printf '\033[1;36m[install]\033[0m  removed /opt/opsbridge-src\n'
-    printf '\033[1;36m[install]\033[0m done.\n'
+    log "  removed /opt/opsbridge-src"
+    log "done."
     exit 0
 fi
-
-REPO_URL="${OPSBRIDGE_REPO_URL:-https://github.com/cheney-yan/OpsBridge.git}"
-# Argument parsing: uninstall | -v <version> | (nothing = latest main)
-REPO_REF="${OPSBRIDGE_REPO_REF:-main}"
-if [[ "${1:-}" == "-v" ]]; then
-    REPO_REF="${2:?"-v requires a version, e.g.: bash -s -- -v v0.4.6"}"
-    shift 2
-elif [[ -n "${1:-}" && "${1:-}" != "uninstall" ]]; then
-    # Legacy positional form: bash -s v0.4.6 (kept for backward compat)
-    REPO_REF="$1"
-    shift
-fi
-SRC_DIR="${OPSBRIDGE_SRC_DIR:-/opt/opsbridge-src}"
-SUPPORTS_TTY=0
-[[ -t 0 ]] && SUPPORTS_TTY=1
-
-log()   { printf '\033[1;36m[install]\033[0m %s\n' "$*"; }
-warn()  { printf '\033[1;33m[install]\033[0m %s\n' "$*" >&2; }
-die()   { printf '\033[1;31m[install]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # --- 1. platform detection ----------------------------------------------------
 KERNEL=$(uname -s)

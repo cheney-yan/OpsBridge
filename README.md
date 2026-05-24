@@ -39,16 +39,14 @@ curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/main/install.s
 > its `sudo` attaches to your real terminal. `curl | sudo bash` silently breaks
 > interactive prompts.
 
-Pin a specific version:
+Pin a version or uninstall — `bash -s --` is how bash accepts arguments through a pipe:
 
 ```bash
+# Install a specific version
 curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/main/install.sh \
-  | bash -s -- -v v0.4.6
-```
+  | bash -s -- install -v v0.4.7
 
-Uninstall:
-
-```bash
+# Uninstall
 curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/main/install.sh \
   | bash -s -- uninstall
 ```
