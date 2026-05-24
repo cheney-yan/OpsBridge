@@ -19,6 +19,9 @@
 # invocation can attach to your REAL TTY.
 #
 # Re-running is safe — choose [k]eep / [r]econfigure / [a]bort on prompt.
+#
+# Uninstall:
+#     curl -fsSL .../install.sh | bash -s uninstall
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -55,6 +58,41 @@ fi
 
 # Past this point: root, running from a real file, fd 0 attached to TTY
 # (or /dev/null in env-var mode).
+
+# ---------------------------------------------------------------------------
+# Uninstall mode: bash install.sh uninstall  OR  curl ... | bash -s uninstall
+# ---------------------------------------------------------------------------
+if [[ "${1:-}" == "uninstall" ]]; then
+    printf '\033[1;36m[install]\033[0m %s\n' "Uninstalling OpsBridge..."
+    if command -v opsbridge >/dev/null 2>&1; then
+        opsbridge uninstall --yes
+    else
+        for f in /etc/sudoers.d/opsbridge-agent \
+                  /etc/ssh/sshd_config.d/50-opsbridge-agent.conf \
+                  /etc/ssh/sshd_config.d/50-opsbridge-agent.conf.disabled \
+                  /usr/local/bin/opsbridge \
+                  /usr/local/bin/opsbridge-agent; do
+            if [[ -e "$f" || -L "$f" ]]; then
+                rm -f "$f"
+                printf '\033[1;36m[install]\033[0m  removed %s\n' "$f"
+            fi
+        done
+        rm -rf /opt/opsbridge /etc/opsbridge
+        if id agent >/dev/null 2>&1; then
+            userdel -r agent 2>/dev/null || true
+            printf '\033[1;36m[install]\033[0m  removed user agent\n'
+        fi
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+        elif command -v service >/dev/null 2>&1; then
+            service ssh reload 2>/dev/null || true
+        fi
+    fi
+    rm -rf /opt/opsbridge-src
+    printf '\033[1;36m[install]\033[0m  removed /opt/opsbridge-src\n'
+    printf '\033[1;36m[install]\033[0m done.\n'
+    exit 0
+fi
 
 REPO_URL="${OPSBRIDGE_REPO_URL:-https://github.com/cheney-yan/OpsBridge.git}"
 REPO_REF="${1:-${OPSBRIDGE_REPO_REF:-main}}"
