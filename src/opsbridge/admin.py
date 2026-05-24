@@ -168,7 +168,27 @@ def _find_snippet(name: str) -> Path | None:
 
 def _prompt(label: str, default: str = "", hidden: bool = False) -> str:
     if hidden:
-        return getpass.getpass(f"{label}: ").strip()
+        # Operate on sys.stdin's own fd so echo is reliably restored for the
+        # next input() call.  getpass opens /dev/tty as a separate fd which
+        # can leave sys.stdin's echo disabled on some SSH+sudo setups.
+        try:
+            import termios as _termios
+            fd = sys.stdin.fileno()
+            old = _termios.tcgetattr(fd)
+            new = list(old)
+            new[3] = new[3] & ~_termios.ECHO
+            try:
+                _termios.tcsetattr(fd, _termios.TCSADRAIN, new)
+                sys.stderr.write(f"{label}: ")
+                sys.stderr.flush()
+                val = sys.stdin.readline().rstrip("\n")
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+            finally:
+                _termios.tcsetattr(fd, _termios.TCSADRAIN, old)
+        except Exception:
+            val = getpass.getpass(f"{label}: ")
+        return val.strip()
     prompt = f"{label} [{default}]: " if default else f"{label}: "
     try:
         return input(prompt).strip() or default
@@ -616,7 +636,12 @@ def _prompt_model_config(existing: dict | None = None) -> dict:
         default_sel_parts = [
             str(discovered.index(mid) + 1) for mid in existing_ids if mid in discovered
         ]
-        default_sel = ",".join(default_sel_parts) if default_sel_parts else "1"
+        if len(default_sel_parts) == len(discovered):
+            default_sel = "all"
+        elif default_sel_parts:
+            default_sel = ",".join(default_sel_parts)
+        else:
+            default_sel = "1"
     else:
         default_sel = "1"
 
