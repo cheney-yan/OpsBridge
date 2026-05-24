@@ -56,7 +56,7 @@ fi
 
 echo "[bootstrap] installing project ..."
 VIRTUAL_ENV="$VENV_DIR" "$UV_BIN" pip install --python "$VENV_DIR/bin/python" \
-    --upgrade "$SRC_DIR"
+    --reinstall "$SRC_DIR"
 
 # --- 4. symlink the admin CLI ------------------------------------------------
 LINK="/usr/local/bin/opsbridge"

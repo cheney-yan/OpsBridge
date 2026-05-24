@@ -1,6 +1,6 @@
 [project]
 name = "opsbridge"
-version = "0.4.4"
+version = "0.5.0"
 description = "SSH-login agent daemon — drop operators into pi.dev instead of a shell."
 readme = "README.md"
 requires-python = ">=3.11"
