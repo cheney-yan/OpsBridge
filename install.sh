@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # OpsBridge one-liner installer.
 #
-# Recommended (interactive, default main):
-#     curl -fsSL .../install.sh | bash         ← no leading sudo
+# Install (latest):
+#     curl -fsSL .../install.sh | bash
 #
-# Pin a specific commit / branch / tag (REF):
-#     curl -fsSL .../REF/install.sh | bash -s REF
+# Install specific version:
+#     curl -fsSL .../install.sh | bash -s -- -v v0.4.6
+#
+# Uninstall:
+#     curl -fsSL .../install.sh | bash -s -- uninstall
 #
 # Non-interactive (CI / Ansible):
 #     OPSBRIDGE_PROVIDER=anthropic \
@@ -14,14 +17,14 @@
 #     OPSBRIDGE_PUBKEY="ssh-ed25519 AAAA... me@host" \
 #     curl -fsSL .../install.sh | bash
 #
+# Why -s --: bash reads the script from the pipe (stdin); -s -- tells it
+# to pass the remaining words as $1, $2, ... to the script.
+#
 # Why no leading sudo: `curl | sudo bash` is fundamentally broken for
 # interactive prompts. This script handles sudo internally so its sudo
 # invocation can attach to your REAL TTY.
 #
 # Re-running is safe — choose [k]eep / [r]econfigure / [a]bort on prompt.
-#
-# Uninstall:
-#     curl -fsSL .../install.sh | bash -s uninstall
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -95,7 +98,16 @@ if [[ "${1:-}" == "uninstall" ]]; then
 fi
 
 REPO_URL="${OPSBRIDGE_REPO_URL:-https://github.com/cheney-yan/OpsBridge.git}"
-REPO_REF="${1:-${OPSBRIDGE_REPO_REF:-main}}"
+# Argument parsing: uninstall | -v <version> | (nothing = latest main)
+REPO_REF="${OPSBRIDGE_REPO_REF:-main}"
+if [[ "${1:-}" == "-v" ]]; then
+    REPO_REF="${2:?"-v requires a version, e.g.: bash -s -- -v v0.4.6"}"
+    shift 2
+elif [[ -n "${1:-}" && "${1:-}" != "uninstall" ]]; then
+    # Legacy positional form: bash -s v0.4.6 (kept for backward compat)
+    REPO_REF="$1"
+    shift
+fi
 SRC_DIR="${OPSBRIDGE_SRC_DIR:-/opt/opsbridge-src}"
 SUPPORTS_TTY=0
 [[ -t 0 ]] && SUPPORTS_TTY=1

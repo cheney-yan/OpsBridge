@@ -39,12 +39,18 @@ curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/main/install.s
 > its `sudo` attaches to your real terminal. `curl | sudo bash` silently breaks
 > interactive prompts.
 
-Pin a specific tag:
+Pin a specific version:
 
 ```bash
-REF=v0.4.3 && \
-curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/$REF/install.sh \
-  | bash -s $REF
+curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/main/install.sh \
+  | bash -s -- -v v0.4.6
+```
+
+Uninstall:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/main/install.sh \
+  | bash -s -- uninstall
 ```
 
 Unattended / CI:
