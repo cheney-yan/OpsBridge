@@ -563,33 +563,64 @@ def _prompt_default_model(selected_ids: list[str], existing_default: str) -> str
 def _prompt_model_config(existing: dict | None = None) -> dict:
     existing = existing or {}
     print()
-    print(bold("Configure model"))
+    print(bold("Configure LLM provider"))
 
-    provider = ""
-    while provider not in ("openai", "anthropic"):
-        provider = _prompt(
-            "Provider [anthropic/openai]",
-            default=existing.get("provider", "anthropic"),
-        ).lower()
-        if provider not in ("openai", "anthropic"):
-            print(err("  must be 'openai' or 'anthropic'"))
+    # --- 1. Provider menu ---
+    print("  1. Anthropic  (Claude — https://console.anthropic.com)")
+    print("  2. OpenAI     (GPT / o-series — https://platform.openai.com)")
+    print("  3. Custom     (any OpenAI-compatible endpoint, e.g. Azure / Bedrock proxy)")
+    print()
 
-    base_url = _prompt("Custom base URL (empty = official)", default=existing.get("base_url", ""))
+    existing_provider = existing.get("provider", "")
+    existing_base_url = existing.get("base_url", "")
+    if existing_provider == "anthropic":
+        default_choice = "1"
+    elif existing_provider == "openai" and existing_base_url:
+        default_choice = "3"
+    elif existing_provider == "openai":
+        default_choice = "2"
+    else:
+        default_choice = "1"
 
+    choice = ""
+    while choice not in ("1", "2", "3"):
+        choice = _prompt("  Choice [1/2/3]", default=default_choice)
+        if choice not in ("1", "2", "3"):
+            print(err("  enter 1, 2, or 3"))
+
+    if choice == "1":
+        provider = "anthropic"
+        base_url = ""
+    elif choice == "2":
+        provider = "openai"
+        base_url = ""
+    else:
+        provider = "openai"
+        base_url = _prompt(
+            "  Base URL (e.g. https://my.proxy.example/v1)",
+            default=existing_base_url,
+        )
+        while not base_url:
+            print(err("  base URL is required for a custom endpoint"))
+            base_url = _prompt("  Base URL")
+
+    # --- 2. API key ---
+    print()
     api_key = ""
     while not api_key:
-        api_key = _prompt("Paste API key (hidden)", hidden=True)
+        api_key = _prompt("API key (hidden)", hidden=True)
 
-    print("  Fetching model list from API...")
+    # --- 3. Discover and select models ---
+    print()
+    print("  Fetching model list...")
     discovered = _discover_models(provider, base_url, api_key)
 
-    print()
-    print(f"  Available {provider} models:")
+    print(f"  Available models ({provider}{' — custom endpoint' if base_url else ''}):")
     for i, mid in enumerate(discovered, 1):
-        marker = " *" if mid == existing.get("model", "") else ""
+        marker = " ←" if mid == existing.get("model", "") else ""
         print(f"    {i:2d}. {mid}{marker}")
     print()
-    print("  Enter numbers, ranges (1-3), comma lists (1,3), or 'all'.")
+    print("  Select models to register (numbers, ranges like 1-3, comma list, or 'all').")
 
     existing_ids = [m["id"] for m in existing.get("models", [])]
     if existing_ids:
@@ -600,7 +631,7 @@ def _prompt_model_config(existing: dict | None = None) -> dict:
     else:
         default_sel = "1"
 
-    raw_sel = _prompt("  Select models", default=default_sel)
+    raw_sel = _prompt("  Select", default=default_sel)
     indices = _parse_model_selection(raw_sel, len(discovered))
     if not indices:
         indices = [0]
@@ -712,7 +743,7 @@ def _build_cfg_from_env() -> dict | None:
         return None
     model = _env_or(
         "OPSBRIDGE_MODEL",
-        "gpt-4.1-mini" if provider == "openai" else "claude-sonnet-4-5",
+        "gpt-4.1-mini" if provider == "openai" else "claude-sonnet-4-6",
     )
     api_key = _env_or("OPSBRIDGE_API_KEY", "")
     if not api_key:
