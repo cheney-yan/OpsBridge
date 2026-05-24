@@ -61,12 +61,12 @@ DEPLOY_SHARE_CANDIDATES = [
 
 KNOWN_MODELS: dict[str, dict[str, int]] = {
     # Anthropic Claude 4.x
-    "claude-opus-4-7":              {"contextWindow": 200_000, "maxTokens":  32_000},
-    "claude-opus-4-5":              {"contextWindow": 200_000, "maxTokens":  32_000},
-    "claude-sonnet-4-6":            {"contextWindow": 200_000, "maxTokens":  64_000},
-    "claude-sonnet-4-5":            {"contextWindow": 200_000, "maxTokens":  64_000},
-    "claude-haiku-4-5-20251001":    {"contextWindow": 200_000, "maxTokens":   8_192},
-    "claude-haiku-4-5":             {"contextWindow": 200_000, "maxTokens":   8_192},
+    "claude-opus-4-7":              {"contextWindow": 1_000_000, "maxTokens": 128_000},
+    "claude-opus-4-5":              {"contextWindow":   200_000, "maxTokens":  32_000},
+    "claude-sonnet-4-6":            {"contextWindow": 1_000_000, "maxTokens":  64_000},
+    "claude-sonnet-4-5":            {"contextWindow":   200_000, "maxTokens":  64_000},
+    "claude-haiku-4-5-20251001":    {"contextWindow":   200_000, "maxTokens":  64_000},
+    "claude-haiku-4-5":             {"contextWindow":   200_000, "maxTokens":  64_000},
     # Anthropic Claude 3.5
     "claude-3-5-sonnet-20241022":   {"contextWindow": 200_000, "maxTokens":   8_192},
     "claude-3-5-haiku-20241022":    {"contextWindow": 200_000, "maxTokens":   8_192},
@@ -81,13 +81,17 @@ KNOWN_MODELS: dict[str, dict[str, int]] = {
     "gpt-4.1":                      {"contextWindow": 1_047_576, "maxTokens":  32_768},
     "gpt-4.1-mini":                 {"contextWindow": 1_047_576, "maxTokens":  32_768},
     "gpt-4.1-nano":                 {"contextWindow": 1_047_576, "maxTokens":  32_768},
-    # OpenAI GPT-5.x (1 M+ context, 128 K max output per May-2026 specs)
-    "gpt-5":                        {"contextWindow": 1_047_576, "maxTokens": 128_000},
+    # OpenAI GPT-5 family — May-2026 official specs
+    "gpt-5":                        {"contextWindow":   400_000, "maxTokens": 272_000},
+    "gpt-5-pro":                    {"contextWindow":   400_000, "maxTokens": 272_000},
+    "gpt-5.2":                      {"contextWindow":   262_144, "maxTokens": 272_000},
+    "gpt-5.4":                      {"contextWindow": 1_047_576, "maxTokens": 272_000},
+    "gpt-5.4-pro":                  {"contextWindow": 1_047_576, "maxTokens": 272_000},
+    "gpt-5.5":                      {"contextWindow": 1_000_000, "maxTokens": 272_000},
+    # Proxy/routing aliases (best-effort based on gpt-5.4 tier)
     "gpt-5.3-codex":                {"contextWindow": 1_047_576, "maxTokens": 128_000},
     "gpt-5.3-codex-spark":          {"contextWindow": 1_047_576, "maxTokens": 128_000},
-    "gpt-5.4":                      {"contextWindow": 1_047_576, "maxTokens": 128_000},
-    "gpt-5.4-mini":                 {"contextWindow": 1_047_576, "maxTokens":  32_768},
-    "gpt-5.5":                      {"contextWindow": 1_047_576, "maxTokens": 128_000},
+    "gpt-5.4-mini":                 {"contextWindow":   200_000, "maxTokens":  32_768},
     # OpenAI reasoning models
     "o1":                           {"contextWindow":   200_000, "maxTokens": 100_000},
     "o1-mini":                      {"contextWindow":   128_000, "maxTokens":  65_536},
@@ -122,12 +126,12 @@ KNOWN_MODELS: dict[str, dict[str, int]] = {
 # Pattern-based fallback: (substring, contextWindow, maxTokens)
 # Checked in order; first match wins.  Used when exact ID not in KNOWN_MODELS.
 _MODEL_PATTERNS: list[tuple[str, int, int]] = [
-    ("claude-opus",      200_000,   32_000),
-    ("claude-sonnet",    200_000,   64_000),
-    ("claude-haiku",     200_000,    8_192),
+    ("claude-opus",    1_000_000,  128_000),
+    ("claude-sonnet",  1_000_000,   64_000),
+    ("claude-haiku",     200_000,   64_000),
     ("claude-3",         200_000,    8_192),
-    ("claude",           200_000,   32_000),
-    ("gpt-5",          1_047_576,  128_000),
+    ("claude",           200_000,   64_000),
+    ("gpt-5",          1_000_000,  272_000),
     ("gpt-4.1",        1_047_576,   32_768),
     ("gpt-4o",           128_000,   16_384),
     ("gpt-4",            128_000,    8_192),
@@ -833,15 +837,16 @@ def _load_existing_config() -> dict:
     try:
         with open(CONFIG_PATH, "rb") as fh:
             data = tomllib.load(fh)
-        models = [
-            {
+        models = []
+        for m in data.get("models", []):
+            if not m.get("id"):
+                continue
+            meta = _lookup_or_prompt_model_meta(m["id"])
+            models.append({
                 "id": m["id"],
-                "contextWindow": m.get("contextWindow", 0),
-                "maxTokens": m.get("maxTokens", 0),
-            }
-            for m in data.get("models", [])
-            if m.get("id")
-        ]
+                "contextWindow": meta.get("contextWindow", m.get("contextWindow", 0)),
+                "maxTokens": meta.get("maxTokens", m.get("maxTokens", 0)),
+            })
         return {
             "provider": data.get("provider", ""),
             "model": data.get("model", ""),

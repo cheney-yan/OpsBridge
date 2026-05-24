@@ -205,8 +205,8 @@ def test_write_pi_models_no_base_url_no_file(tmp_path, monkeypatch):
 
 def test_known_models_anthropic():
     m = admin.KNOWN_MODELS["claude-opus-4-7"]
-    assert m["contextWindow"] == 200_000
-    assert m["maxTokens"] == 32_000
+    assert m["contextWindow"] == 1_000_000   # 1 M context as of Apr-2026
+    assert m["maxTokens"] == 128_000
 
 
 def test_known_models_openai():
@@ -296,7 +296,7 @@ def test_discover_models_openai_fallback(monkeypatch):
 
 def test_lookup_or_prompt_model_meta_known():
     result = admin._lookup_or_prompt_model_meta("claude-opus-4-7")
-    assert result == {"id": "claude-opus-4-7", "contextWindow": 200_000, "maxTokens": 32_000}
+    assert result == {"id": "claude-opus-4-7", "contextWindow": 1_000_000, "maxTokens": 128_000}
 
 
 def test_lookup_or_prompt_model_meta_unknown():
@@ -320,7 +320,7 @@ def test_write_config_with_models(tmp_path, monkeypatch):
         "base_url": "",
         "api_key": "test-key",
         "models": [
-            {"id": "claude-opus-4-7", "contextWindow": 200_000, "maxTokens": 32_000},
+            {"id": "claude-opus-4-7", "contextWindow": 1_000_000, "maxTokens": 128_000},
             {"id": "claude-sonnet-4-6", "contextWindow": 200_000, "maxTokens": 64_000},
         ],
     }
@@ -331,7 +331,7 @@ def test_write_config_with_models(tmp_path, monkeypatch):
     assert data["model"] == "claude-opus-4-7"
     assert len(data["models"]) == 2
     assert data["models"][0]["id"] == "claude-opus-4-7"
-    assert data["models"][0]["contextWindow"] == 200_000
+    assert data["models"][0]["contextWindow"] == 1_000_000
     assert data["models"][1]["id"] == "claude-sonnet-4-6"
     assert data["models"][1]["maxTokens"] == 64_000
 
@@ -367,7 +367,7 @@ def test_load_existing_config_with_models(tmp_path, monkeypatch):
     result = admin._load_existing_config()
     assert result["provider"] == "anthropic"
     assert len(result["models"]) == 1
-    assert result["models"][0] == {"id": "claude-opus-4-7", "contextWindow": 200_000, "maxTokens": 32_000}
+    assert result["models"][0] == {"id": "claude-opus-4-7", "contextWindow": 1_000_000, "maxTokens": 128_000}
 
 
 def test_load_existing_config_no_models_key(tmp_path, monkeypatch):
@@ -389,15 +389,15 @@ def test_write_pi_models_with_models_list(tmp_path, monkeypatch):
     admin._write_pi_models({
         "provider": "anthropic",
         "base_url": "",
-        "models": [{"id": "claude-opus-4-7", "contextWindow": 200_000, "maxTokens": 32_000}],
+        "models": [{"id": "claude-opus-4-7", "contextWindow": 1_000_000, "maxTokens": 128_000}],
     })
     data = json.loads(models_path.read_text())
     entry = data["providers"]["anthropic"]
     assert entry["api"] == "anthropic-messages"
     assert "baseUrl" not in entry
     assert entry["models"][0]["id"] == "claude-opus-4-7"
-    assert entry["models"][0]["contextWindow"] == 200_000
-    assert entry["models"][0]["maxTokens"] == 32_000
+    assert entry["models"][0]["contextWindow"] == 1_000_000
+    assert entry["models"][0]["maxTokens"] == 128_000
 
 
 def test_write_pi_models_base_url_and_models(tmp_path, monkeypatch):
@@ -428,8 +428,8 @@ def test_build_cfg_from_env_includes_models(monkeypatch):
     assert cfg is not None
     assert len(cfg["models"]) == 1
     assert cfg["models"][0]["id"] == "claude-opus-4-7"
-    assert cfg["models"][0]["contextWindow"] == 200_000
-    assert cfg["models"][0]["maxTokens"] == 32_000
+    assert cfg["models"][0]["contextWindow"] == 1_000_000
+    assert cfg["models"][0]["maxTokens"] == 128_000
 
 
 def test_build_cfg_from_env_unknown_model_gets_defaults(monkeypatch):

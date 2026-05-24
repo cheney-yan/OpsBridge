@@ -90,7 +90,7 @@ wheels = [
 
 [[package]]
 name = "opsbridge"
-version = "0.2.0"
+version = "0.5.8"
 source = { editable = "." }
 
 [package.optional-dependencies]
