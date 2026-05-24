@@ -631,8 +631,7 @@ def _prompt_default_model(selected_ids: list[str], existing_default: str) -> str
     print()
     print("  Select the default model (used by the launcher):")
     for i, mid in enumerate(selected_ids, 1):
-        marker = " *" if mid == existing_default else ""
-        print(f"    {i}. {mid}{marker}")
+        print(f"    {i}. {mid}")
     default_idx = (
         selected_ids.index(existing_default) + 1
         if existing_default in selected_ids
