@@ -734,30 +734,27 @@ def _prompt_model_config(existing: dict | None = None) -> dict:
 
     models_meta = [_lookup_or_prompt_model_meta(mid) for mid in selected_ids]
 
-    # Offer to configure limits for models not in the local registry
-    unknown_metas = [m for m in models_meta if m["id"] not in KNOWN_MODELS]
-    if unknown_metas:
-        print()
-        print(f"  {len(unknown_metas)} model(s) not in local registry — inferred limits:")
-        for m in unknown_metas:
-            print(f"    {m['id']:<40}  ctx={m['contextWindow']:>9,}  max={m['maxTokens']:>7,}")
-        print()
-        ans = _prompt("  Configure token limits for these now?", default="n")
-        if ans.lower().startswith("y"):
-            for m in models_meta:
-                if m["id"] in KNOWN_MODELS:
-                    continue
-                print(f"  {m['id']}")
-                ctx_raw = _prompt("    Context window (tokens)", default=str(m["contextWindow"]))
-                max_raw = _prompt("    Max output tokens", default=str(m["maxTokens"]))
-                try:
-                    m["contextWindow"] = int(ctx_raw.replace(",", "").replace("_", ""))
-                except ValueError:
-                    pass
-                try:
-                    m["maxTokens"] = int(max_raw.replace(",", "").replace("_", ""))
-                except ValueError:
-                    pass
+    # Show assumed token limits for all selected models and offer to adjust
+    print()
+    print("  Assumed token limits (press Enter to accept, or type a value to override):")
+    for m in models_meta:
+        src = "registry" if m["id"] in KNOWN_MODELS else "inferred"
+        print(f"    {m['id']:<40}  ctx={m['contextWindow']:>9,}  max={m['maxTokens']:>7,}  ({src})")
+    print()
+    ans = _prompt("  Adjust any limits?", default="n")
+    if ans.lower().startswith("y"):
+        for m in models_meta:
+            print(f"  {m['id']}")
+            ctx_raw = _prompt("    Context window (tokens)", default=str(m["contextWindow"]))
+            max_raw = _prompt("    Max output tokens", default=str(m["maxTokens"]))
+            try:
+                m["contextWindow"] = int(ctx_raw.replace(",", "").replace("_", ""))
+            except ValueError:
+                pass
+            try:
+                m["maxTokens"] = int(max_raw.replace(",", "").replace("_", ""))
+            except ValueError:
+                pass
 
     model = _prompt_default_model(selected_ids, existing.get("model", ""))
 
