@@ -157,9 +157,16 @@ fi
 
 # --- 3. acquire source --------------------------------------------------------
 log "acquiring source → $SRC_DIR"
+# Allow root to operate on repos owned by another user (re-installs, ownership drift).
+git config --global --add safe.directory "$SRC_DIR" 2>/dev/null || true
 if [[ -d "$SRC_DIR/.git" ]]; then
-    git -C "$SRC_DIR" fetch --depth 1 origin "$REPO_REF" || warn "git fetch failed; using cached copy"
-    git -C "$SRC_DIR" checkout FETCH_HEAD || git -C "$SRC_DIR" checkout "$REPO_REF" || true
+    if ! git -C "$SRC_DIR" fetch --depth 1 origin "$REPO_REF" 2>/dev/null; then
+        warn "git fetch failed — re-cloning from scratch"
+        rm -rf "$SRC_DIR"
+        git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$SRC_DIR"
+    else
+        git -C "$SRC_DIR" checkout FETCH_HEAD || git -C "$SRC_DIR" checkout "$REPO_REF" || true
+    fi
 elif command -v git >/dev/null 2>&1; then
     rm -rf "$SRC_DIR"
     if ! git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$SRC_DIR" 2>/dev/null; then
