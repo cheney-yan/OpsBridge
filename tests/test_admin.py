@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import tomllib
 import pytest
 
 from opsbridge import admin
@@ -196,3 +197,255 @@ def test_write_pi_models_no_base_url_no_file(tmp_path, monkeypatch):
     monkeypatch.setattr(admin.shutil, "chown", lambda *a, **kw: None)
     admin._write_pi_models({"provider": "anthropic", "base_url": ""})
     assert not models_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Model registry constants
+# ---------------------------------------------------------------------------
+
+def test_known_models_anthropic():
+    m = admin.KNOWN_MODELS["claude-opus-4-7"]
+    assert m["contextWindow"] == 200_000
+    assert m["maxTokens"] == 32_000
+
+
+def test_known_models_openai():
+    m = admin.KNOWN_MODELS["gpt-4o"]
+    assert m["contextWindow"] == 128_000
+    assert "maxTokens" in m
+
+
+def test_anthropic_models_ordered_is_list():
+    assert "claude-opus-4-7" in admin.ANTHROPIC_MODELS_ORDERED
+    assert "claude-sonnet-4-6" in admin.ANTHROPIC_MODELS_ORDERED
+
+
+def test_openai_default_models_is_list():
+    assert "gpt-4o" in admin.OPENAI_DEFAULT_MODELS
+    assert "gpt-4.1-mini" in admin.OPENAI_DEFAULT_MODELS
+
+
+# ---------------------------------------------------------------------------
+# _parse_model_selection
+# ---------------------------------------------------------------------------
+
+def test_parse_model_selection_all():
+    assert admin._parse_model_selection("all", 4) == [0, 1, 2, 3]
+
+
+def test_parse_model_selection_empty_string():
+    assert admin._parse_model_selection("", 3) == [0, 1, 2]
+
+
+def test_parse_model_selection_single():
+    assert admin._parse_model_selection("2", 5) == [1]
+
+
+def test_parse_model_selection_comma():
+    assert admin._parse_model_selection("1,3", 5) == [0, 2]
+
+
+def test_parse_model_selection_range():
+    assert admin._parse_model_selection("1-3", 5) == [0, 1, 2]
+
+
+def test_parse_model_selection_out_of_range():
+    assert admin._parse_model_selection("99", 3) == []
+
+
+def test_parse_model_selection_dedup():
+    assert admin._parse_model_selection("1,1,2", 5) == [0, 1]
+
+
+# ---------------------------------------------------------------------------
+# _discover_models
+# ---------------------------------------------------------------------------
+
+def test_discover_models_anthropic_success(monkeypatch):
+    payload = json.dumps({"data": [{"id": "claude-opus-4-7"}, {"id": "claude-sonnet-4-6"}]}).encode()
+
+    class _FakeResp:
+        def read(self): return payload
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    monkeypatch.setattr(admin.urllib.request, "urlopen", lambda *a, **kw: _FakeResp())
+    result = admin._discover_models("anthropic", "", "test-key")
+    assert result == ["claude-opus-4-7", "claude-sonnet-4-6"]
+
+
+def test_discover_models_anthropic_fallback(monkeypatch):
+    def _raise(*a, **kw):
+        raise OSError("network error")
+    monkeypatch.setattr(admin.urllib.request, "urlopen", _raise)
+    result = admin._discover_models("anthropic", "", "test-key")
+    assert result == admin.ANTHROPIC_MODELS_ORDERED
+
+
+def test_discover_models_openai_fallback(monkeypatch):
+    def _raise(*a, **kw):
+        raise OSError("network error")
+    monkeypatch.setattr(admin.urllib.request, "urlopen", _raise)
+    result = admin._discover_models("openai", "", "test-key")
+    assert result == admin.OPENAI_DEFAULT_MODELS
+
+
+# ---------------------------------------------------------------------------
+# _lookup_or_prompt_model_meta
+# ---------------------------------------------------------------------------
+
+def test_lookup_or_prompt_model_meta_known():
+    result = admin._lookup_or_prompt_model_meta("claude-opus-4-7")
+    assert result == {"id": "claude-opus-4-7", "contextWindow": 200_000, "maxTokens": 32_000}
+
+
+def test_lookup_or_prompt_model_meta_unknown(monkeypatch):
+    calls: list[str] = []
+
+    def fake_input(prompt: str) -> str:
+        calls.append(prompt)
+        return "200000" if len(calls) == 1 else "8192"
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    result = admin._lookup_or_prompt_model_meta("my-custom-model-v99")
+    assert result["id"] == "my-custom-model-v99"
+    assert result["contextWindow"] == 200_000
+    assert result["maxTokens"] == 8_192
+
+
+# ---------------------------------------------------------------------------
+# _write_config with [[models]]
+# ---------------------------------------------------------------------------
+
+def test_write_config_with_models(tmp_path, monkeypatch):
+    monkeypatch.setattr(admin, "CONFIG_PATH", tmp_path / "config.toml")
+    monkeypatch.setattr(admin, "API_KEY_PATH", tmp_path / "api.key")
+    monkeypatch.setattr(admin.shutil, "chown", lambda *a, **kw: None)
+    cfg = {
+        "provider": "anthropic",
+        "model": "claude-opus-4-7",
+        "base_url": "",
+        "api_key": "test-key",
+        "models": [
+            {"id": "claude-opus-4-7", "contextWindow": 200_000, "maxTokens": 32_000},
+            {"id": "claude-sonnet-4-6", "contextWindow": 200_000, "maxTokens": 64_000},
+        ],
+    }
+    admin._write_config(cfg)
+    with open(tmp_path / "config.toml", "rb") as fh:
+        data = tomllib.load(fh)
+    assert data["provider"] == "anthropic"
+    assert data["model"] == "claude-opus-4-7"
+    assert len(data["models"]) == 2
+    assert data["models"][0]["id"] == "claude-opus-4-7"
+    assert data["models"][0]["contextWindow"] == 200_000
+    assert data["models"][1]["id"] == "claude-sonnet-4-6"
+    assert data["models"][1]["maxTokens"] == 64_000
+
+
+def test_write_config_no_models(tmp_path, monkeypatch):
+    monkeypatch.setattr(admin, "CONFIG_PATH", tmp_path / "config.toml")
+    monkeypatch.setattr(admin, "API_KEY_PATH", tmp_path / "api.key")
+    monkeypatch.setattr(admin.shutil, "chown", lambda *a, **kw: None)
+    cfg = {"provider": "openai", "model": "gpt-4o", "base_url": "", "api_key": "k"}
+    admin._write_config(cfg)
+    with open(tmp_path / "config.toml", "rb") as fh:
+        data = tomllib.load(fh)
+    assert data["provider"] == "openai"
+    assert "models" not in data
+
+
+# ---------------------------------------------------------------------------
+# _load_existing_config with models
+# ---------------------------------------------------------------------------
+
+def test_load_existing_config_with_models(tmp_path, monkeypatch):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        'provider = "anthropic"\n'
+        'model    = "claude-opus-4-7"\n'
+        "\n"
+        "[[models]]\n"
+        'id            = "claude-opus-4-7"\n'
+        "contextWindow = 200000\n"
+        "maxTokens     = 32000\n"
+    )
+    monkeypatch.setattr(admin, "CONFIG_PATH", config)
+    result = admin._load_existing_config()
+    assert result["provider"] == "anthropic"
+    assert len(result["models"]) == 1
+    assert result["models"][0] == {"id": "claude-opus-4-7", "contextWindow": 200_000, "maxTokens": 32_000}
+
+
+def test_load_existing_config_no_models_key(tmp_path, monkeypatch):
+    config = tmp_path / "config.toml"
+    config.write_text('provider = "openai"\nmodel = "gpt-4o"\n')
+    monkeypatch.setattr(admin, "CONFIG_PATH", config)
+    result = admin._load_existing_config()
+    assert result["models"] == []
+
+
+# ---------------------------------------------------------------------------
+# _write_pi_models with models list
+# ---------------------------------------------------------------------------
+
+def test_write_pi_models_with_models_list(tmp_path, monkeypatch):
+    models_path = tmp_path / "models.json"
+    monkeypatch.setattr(admin, "PI_MODELS_JSON", models_path)
+    monkeypatch.setattr(admin.shutil, "chown", lambda *a, **kw: None)
+    admin._write_pi_models({
+        "provider": "anthropic",
+        "base_url": "",
+        "models": [{"id": "claude-opus-4-7", "contextWindow": 200_000, "maxTokens": 32_000}],
+    })
+    data = json.loads(models_path.read_text())
+    entry = data["providers"]["anthropic"]
+    assert entry["api"] == "anthropic-messages"
+    assert "baseUrl" not in entry
+    assert entry["models"][0]["id"] == "claude-opus-4-7"
+    assert entry["models"][0]["contextWindow"] == 200_000
+    assert entry["models"][0]["maxTokens"] == 32_000
+
+
+def test_write_pi_models_base_url_and_models(tmp_path, monkeypatch):
+    models_path = tmp_path / "models.json"
+    monkeypatch.setattr(admin, "PI_MODELS_JSON", models_path)
+    monkeypatch.setattr(admin.shutil, "chown", lambda *a, **kw: None)
+    admin._write_pi_models({
+        "provider": "openai",
+        "base_url": "https://my.proxy.example/v1",
+        "models": [{"id": "gpt-4o", "contextWindow": 128_000, "maxTokens": 16_384}],
+    })
+    data = json.loads(models_path.read_text())
+    entry = data["providers"]["openai"]
+    assert entry["baseUrl"] == "https://my.proxy.example/v1"
+    assert entry["models"][0]["id"] == "gpt-4o"
+
+
+# ---------------------------------------------------------------------------
+# _build_cfg_from_env with models
+# ---------------------------------------------------------------------------
+
+def test_build_cfg_from_env_includes_models(monkeypatch):
+    monkeypatch.setenv("OPSBRIDGE_PROVIDER", "anthropic")
+    monkeypatch.setenv("OPSBRIDGE_MODEL", "claude-opus-4-7")
+    monkeypatch.setenv("OPSBRIDGE_API_KEY", "test-key")
+    monkeypatch.delenv("OPSBRIDGE_BASE_URL", raising=False)
+    cfg = admin._build_cfg_from_env()
+    assert cfg is not None
+    assert len(cfg["models"]) == 1
+    assert cfg["models"][0]["id"] == "claude-opus-4-7"
+    assert cfg["models"][0]["contextWindow"] == 200_000
+    assert cfg["models"][0]["maxTokens"] == 32_000
+
+
+def test_build_cfg_from_env_unknown_model_gets_defaults(monkeypatch):
+    monkeypatch.setenv("OPSBRIDGE_PROVIDER", "openai")
+    monkeypatch.setenv("OPSBRIDGE_MODEL", "my-custom-proxy-model")
+    monkeypatch.setenv("OPSBRIDGE_API_KEY", "test-key")
+    monkeypatch.delenv("OPSBRIDGE_BASE_URL", raising=False)
+    cfg = admin._build_cfg_from_env()
+    assert cfg is not None
+    assert cfg["models"][0]["id"] == "my-custom-proxy-model"
+    assert cfg["models"][0]["contextWindow"] == 128_000
+    assert cfg["models"][0]["maxTokens"] == 4_096

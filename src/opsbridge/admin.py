@@ -18,6 +18,8 @@ import subprocess
 import sys
 import textwrap
 import tomllib
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from . import __version__
@@ -51,6 +53,47 @@ DEPLOY_SHARE_CANDIDATES = [
     Path(__file__).parent.parent.parent / "deploy",  # source layout
     Path("/opt/opsbridge-src/deploy"),
     Path("/usr/local/share/opsbridge"),
+]
+
+# ---------------------------------------------------------------------------
+# Model registry
+# ---------------------------------------------------------------------------
+
+KNOWN_MODELS: dict[str, dict[str, int]] = {
+    "claude-opus-4-7":           {"contextWindow": 200_000, "maxTokens":  32_000},
+    "claude-opus-4-5":           {"contextWindow": 200_000, "maxTokens":  32_000},
+    "claude-sonnet-4-6":         {"contextWindow": 200_000, "maxTokens":  64_000},
+    "claude-sonnet-4-5":         {"contextWindow": 200_000, "maxTokens":  64_000},
+    "claude-haiku-4-5-20251001": {"contextWindow": 200_000, "maxTokens":   8_192},
+    "claude-haiku-4-5":          {"contextWindow": 200_000, "maxTokens":   8_192},
+    "gpt-4o":                    {"contextWindow": 128_000, "maxTokens":  16_384},
+    "gpt-4o-mini":               {"contextWindow": 128_000, "maxTokens":  16_384},
+    "gpt-4.1":                   {"contextWindow": 1_047_576, "maxTokens": 32_768},
+    "gpt-4.1-mini":              {"contextWindow": 1_047_576, "maxTokens": 32_768},
+    "gpt-4.1-nano":              {"contextWindow": 1_047_576, "maxTokens": 32_768},
+    "o1":                        {"contextWindow": 200_000, "maxTokens": 100_000},
+    "o3":                        {"contextWindow": 200_000, "maxTokens": 100_000},
+    "o4-mini":                   {"contextWindow": 200_000, "maxTokens": 100_000},
+}
+
+ANTHROPIC_MODELS_ORDERED = [
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+    "claude-opus-4-5",
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5",
+]
+
+OPENAI_DEFAULT_MODELS = [
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "o1",
+    "o3",
+    "o4-mini",
 ]
 
 # ---------------------------------------------------------------------------
@@ -361,22 +404,27 @@ def _write_pi_auth(cfg: dict) -> None:
 
 
 def _write_pi_models(cfg: dict) -> None:
-    """Write ~agent/.pi/agent/models.json with baseUrl override if configured."""
+    """Write ~agent/.pi/agent/models.json with model metadata and optional baseUrl."""
     base_url = cfg.get("base_url", "").strip()
-    if not base_url:
+    models_list = cfg.get("models", [])
+
+    if not base_url and not models_list:
         if PI_MODELS_JSON.exists():
             PI_MODELS_JSON.unlink()
         return
+
     api_type = "anthropic-messages" if cfg["provider"] == "anthropic" else "openai-completions"
-    models = {
-        "providers": {
-            cfg["provider"]: {
-                "baseUrl": base_url,
-                "api": api_type,
-            }
-        }
-    }
-    _write_root(PI_MODELS_JSON, json.dumps(models, indent=2) + "\n",
+    provider_entry: dict = {"api": api_type}
+    if base_url:
+        provider_entry["baseUrl"] = base_url
+    if models_list:
+        provider_entry["models"] = [
+            {"id": m["id"], "contextWindow": m["contextWindow"], "maxTokens": m["maxTokens"]}
+            for m in models_list
+        ]
+
+    models_json = {"providers": {cfg["provider"]: provider_entry}}
+    _write_root(PI_MODELS_JSON, json.dumps(models_json, indent=2) + "\n",
                 owner="agent", group="agent", mode=0o600)
 
 
@@ -395,6 +443,111 @@ def _write_system_prompt(force: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Model discovery and selection
+# ---------------------------------------------------------------------------
+
+def _discover_models(provider: str, base_url: str, api_key: str) -> list[str]:
+    """Fetch model IDs from the provider API. Falls back to built-in lists."""
+    try:
+        if provider == "anthropic":
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/models",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read())
+            ids = [m["id"] for m in data.get("data", []) if m.get("id")]
+            return ids if ids else ANTHROPIC_MODELS_ORDERED[:]
+        else:
+            base = (base_url or "https://api.openai.com/v1").rstrip("/")
+            req = urllib.request.Request(
+                f"{base}/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read())
+            ids = [m["id"] for m in data.get("data", []) if m.get("id")]
+            return sorted(ids) if ids else OPENAI_DEFAULT_MODELS[:]
+    except Exception:  # noqa: BLE001
+        pass
+    return ANTHROPIC_MODELS_ORDERED[:] if provider == "anthropic" else OPENAI_DEFAULT_MODELS[:]
+
+
+def _parse_model_selection(raw: str, max_idx: int) -> list[int]:
+    """Parse 'all', '1,3', '1-3', or '2' into 0-based index list."""
+    raw = raw.strip()
+    if not raw or raw.lower() == "all":
+        return list(range(max_idx))
+    seen: set[int] = set()
+    result: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo_s, _, hi_s = part.partition("-")
+            try:
+                lo_i = int(lo_s.strip()) - 1
+                hi_i = int(hi_s.strip()) - 1
+                for idx in range(max(0, lo_i), min(max_idx - 1, hi_i) + 1):
+                    if idx not in seen:
+                        seen.add(idx)
+                        result.append(idx)
+            except ValueError:
+                pass
+        else:
+            try:
+                idx = int(part) - 1
+                if 0 <= idx < max_idx and idx not in seen:
+                    seen.add(idx)
+                    result.append(idx)
+            except ValueError:
+                pass
+    return result
+
+
+def _lookup_or_prompt_model_meta(model_id: str) -> dict:
+    """Return {id, contextWindow, maxTokens} — look up KNOWN_MODELS or prompt."""
+    meta = KNOWN_MODELS.get(model_id)
+    if meta:
+        return {"id": model_id, **meta}
+    print(f"  '{model_id}' not in local registry — enter token limits.")
+    ctx_raw = _prompt("  Context window (tokens)", default="128000")
+    max_raw = _prompt("  Max output tokens", default="4096")
+    try:
+        ctx = int(ctx_raw.replace(",", "").replace("_", ""))
+    except ValueError:
+        ctx = 128_000
+    try:
+        max_tok = int(max_raw.replace(",", "").replace("_", ""))
+    except ValueError:
+        max_tok = 4_096
+    return {"id": model_id, "contextWindow": ctx, "maxTokens": max_tok}
+
+
+def _prompt_default_model(selected_ids: list[str], existing_default: str) -> str:
+    """Prompt user to pick the default model from the selected set."""
+    if len(selected_ids) == 1:
+        return selected_ids[0]
+    print()
+    print("  Select the default model (used by the launcher):")
+    for i, mid in enumerate(selected_ids, 1):
+        marker = " *" if mid == existing_default else ""
+        print(f"    {i}. {mid}{marker}")
+    default_idx = (
+        selected_ids.index(existing_default) + 1
+        if existing_default in selected_ids
+        else 1
+    )
+    raw = _prompt("  Default model", default=str(default_idx))
+    try:
+        idx = int(raw) - 1
+        if 0 <= idx < len(selected_ids):
+            return selected_ids[idx]
+    except ValueError:
+        pass
+    return selected_ids[0]
+
+
+# ---------------------------------------------------------------------------
 # Model config
 # ---------------------------------------------------------------------------
 
@@ -402,6 +555,7 @@ def _prompt_model_config(existing: dict | None = None) -> dict:
     existing = existing or {}
     print()
     print(bold("Configure model"))
+
     provider = ""
     while provider not in ("openai", "anthropic"):
         provider = _prompt(
@@ -410,15 +564,49 @@ def _prompt_model_config(existing: dict | None = None) -> dict:
         ).lower()
         if provider not in ("openai", "anthropic"):
             print(err("  must be 'openai' or 'anthropic'"))
-    default_model = existing.get(
-        "model", "gpt-4o" if provider == "openai" else "claude-sonnet-4-5"
-    )
-    model = _prompt("Model", default=default_model)
+
     base_url = _prompt("Custom base URL (empty = official)", default=existing.get("base_url", ""))
+
     api_key = ""
     while not api_key:
         api_key = _prompt("Paste API key (hidden)", hidden=True)
-    return {"provider": provider, "model": model, "base_url": base_url, "api_key": api_key}
+
+    print("  Fetching model list from API...")
+    discovered = _discover_models(provider, base_url, api_key)
+
+    print()
+    print(f"  Available {provider} models:")
+    for i, mid in enumerate(discovered, 1):
+        marker = " *" if mid == existing.get("model", "") else ""
+        print(f"    {i:2d}. {mid}{marker}")
+    print()
+    print("  Enter numbers, ranges (1-3), comma lists (1,3), or 'all'.")
+
+    existing_ids = [m["id"] for m in existing.get("models", [])]
+    if existing_ids:
+        default_sel_parts = [
+            str(discovered.index(mid) + 1) for mid in existing_ids if mid in discovered
+        ]
+        default_sel = ",".join(default_sel_parts) if default_sel_parts else "1"
+    else:
+        default_sel = "1"
+
+    raw_sel = _prompt("  Select models", default=default_sel)
+    indices = _parse_model_selection(raw_sel, len(discovered))
+    if not indices:
+        indices = [0]
+    selected_ids = [discovered[i] for i in indices]
+
+    models_meta = [_lookup_or_prompt_model_meta(mid) for mid in selected_ids]
+    model = _prompt_default_model(selected_ids, existing.get("model", ""))
+
+    return {
+        "provider": provider,
+        "model": model,
+        "base_url": base_url,
+        "api_key": api_key,
+        "models": models_meta,
+    }
 
 
 def _prompt_pubkey(existing: bytes = b"") -> str:
@@ -470,6 +658,12 @@ def _write_config(cfg: dict) -> None:
     if cfg.get("base_url"):
         lines.append(f'base_url = "{cfg["base_url"]}"')
     lines.append("")
+    for m in cfg.get("models", []):
+        lines.append("[[models]]")
+        lines.append(f'id            = "{m["id"]}"')
+        lines.append(f'contextWindow = {m["contextWindow"]}')
+        lines.append(f'maxTokens     = {m["maxTokens"]}')
+        lines.append("")
     _write_root(CONFIG_PATH, "\n".join(lines), owner="root", group="agent", mode=0o440)
     _write_root(API_KEY_PATH, cfg["api_key"] + "\n", owner="agent", group="agent", mode=0o400)
 
@@ -480,10 +674,20 @@ def _load_existing_config() -> dict:
     try:
         with open(CONFIG_PATH, "rb") as fh:
             data = tomllib.load(fh)
+        models = [
+            {
+                "id": m["id"],
+                "contextWindow": m.get("contextWindow", 0),
+                "maxTokens": m.get("maxTokens", 0),
+            }
+            for m in data.get("models", [])
+            if m.get("id")
+        ]
         return {
             "provider": data.get("provider", ""),
             "model": data.get("model", ""),
             "base_url": data.get("base_url", ""),
+            "models": models,
         }
     except (OSError, tomllib.TOMLDecodeError):
         return {}
@@ -505,7 +709,12 @@ def _build_cfg_from_env() -> dict | None:
     if not api_key:
         return None
     base_url = _env_or("OPSBRIDGE_BASE_URL", "")
-    return {"provider": provider, "model": model, "base_url": base_url, "api_key": api_key}
+    meta = KNOWN_MODELS.get(model)
+    if meta:
+        models = [{"id": model, **meta}]
+    else:
+        models = [{"id": model, "contextWindow": 128_000, "maxTokens": 4_096}]
+    return {"provider": provider, "model": model, "base_url": base_url, "api_key": api_key, "models": models}
 
 
 # ---------------------------------------------------------------------------

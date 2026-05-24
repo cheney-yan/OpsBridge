@@ -221,124 +221,6 @@ _mask() {
     fi
 }
 
-# Query the configured LLM for its model list. One model id per line.
-discover_models() {
-    local provider="$OPSBRIDGE_PROVIDER"
-    local key="$OPSBRIDGE_API_KEY"
-
-    if [[ "$provider" == "anthropic" ]]; then
-        # Anthropic doesn't expose a useful /v1/models list; return curated set.
-        printf 'claude-haiku-4-5\nclaude-sonnet-4-6\nclaude-opus-4-7\n'
-        return 0
-    fi
-
-    local resp
-    resp=$(curl -fsS -m 10 \
-        -H "Authorization: Bearer $key" \
-        "https://api.openai.com/v1/models" 2>/dev/null) || return 1
-    [[ -z "$resp" ]] && return 1
-
-    if command -v python3 >/dev/null 2>&1; then
-        printf '%s' "$resp" | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-    items = data.get("data", data) if isinstance(data, dict) else data
-    for m in items or []:
-        mid = m.get("id") or m.get("name") if isinstance(m, dict) else m
-        if mid:
-            print(mid)
-except Exception:
-    pass
-'
-    else
-        printf '%s' "$resp" | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' | \
-            sed 's/.*"\([^"]\+\)".*/\1/'
-    fi
-}
-
-default_model_from_list() {
-    local provider="$1"
-    local models="$2"
-    local pick=""
-    case "$provider" in
-        anthropic)
-            pick=$(printf '%s\n' "$models" | grep -E '^claude-sonnet' | tail -1)
-            [[ -z "$pick" ]] && pick=$(printf '%s\n' "$models" | grep -iE 'sonnet' | head -1)
-            ;;
-        openai)
-            pick=$(printf '%s\n' "$models" | grep -E '^gpt-[0-9].*mini$' | tail -1)
-            [[ -z "$pick" ]] && pick=$(printf '%s\n' "$models" | grep -E '^gpt-' | head -1)
-            ;;
-    esac
-    [[ -z "$pick" ]] && pick=$(printf '%s\n' "$models" | head -1)
-    if [[ -z "$pick" ]]; then
-        case "$provider" in
-            openai)    pick="gpt-4.1-mini" ;;
-            anthropic) pick="claude-opus-4-7" ;;
-        esac
-    fi
-    echo "$pick"
-}
-
-# Offer a numbered model picker, then verify with a tiny LLM round-trip.
-prompt_for_model() {
-    local provider="$OPSBRIDGE_PROVIDER"
-    local models default
-
-    log "discovering models ..."
-    models=$(discover_models 2>/dev/null) || true
-
-    if [[ -z "$models" ]]; then
-        warn "  couldn't fetch model list — type a model id manually."
-        case "$provider" in
-            openai)    default="gpt-4.1-mini" ;;
-            anthropic) default="claude-opus-4-7" ;;
-        esac
-        while :; do
-            local model
-            read -r -p "Model [$default]: " model
-            OPSBRIDGE_MODEL="${model:-$default}"
-            export OPSBRIDGE_MODEL
-            if check_llm_endpoint; then return 0; fi
-            warn "Try another model id."
-        done
-    fi
-
-    default=$(default_model_from_list "$provider" "$models")
-
-    while :; do
-        echo
-        log "Available models (★ = recommended default):"
-        local arr=() i=1 m
-        while IFS= read -r m; do
-            [[ -z "$m" ]] && continue
-            arr+=("$m")
-            if [[ "$m" == "$default" ]]; then
-                printf '  %2d. %s ★\n' "$i" "$m"
-            else
-                printf '  %2d. %s\n' "$i" "$m"
-            fi
-            ((i++))
-            [[ "$i" -gt 15 ]] && { printf '  ... (%d more)\n' $(($(printf '%s\n' "$models" | wc -l) - 15)); break; }
-        done <<< "$models"
-        echo
-        local choice
-        read -r -p "Pick a number, or paste a model id [default: $default]: " choice
-        if [[ -z "$choice" ]]; then
-            OPSBRIDGE_MODEL="$default"
-        elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#arr[@]} )); then
-            OPSBRIDGE_MODEL="${arr[$((choice-1))]}"
-        else
-            OPSBRIDGE_MODEL="$choice"
-        fi
-        export OPSBRIDGE_MODEL
-        echo "  selected: $OPSBRIDGE_MODEL"
-        if check_llm_endpoint; then return 0; fi
-        warn "Pick a different model (or paste an id)."
-    done
-}
-
 prompt_for_config() {
     echo
     log "Configure model"
@@ -369,18 +251,17 @@ prompt_for_config() {
         echo "  captured: $(_mask "$OPSBRIDGE_API_KEY")  → /etc/opsbridge/agent/api.key"
         break
     done
-
-    prompt_for_model
+    # Model discovery and selection is handled by: opsbridge install
 }
 
 show_config_review() {
     echo
     log "Configured (review before applying):"
-    printf '  %-12s : %s\n' "provider" "$OPSBRIDGE_PROVIDER"
-    printf '  %-12s : %s\n' "model"    "$OPSBRIDGE_MODEL"
+    printf '  %-12s : %s\n' "provider" "${OPSBRIDGE_PROVIDER:-}"
     printf '  %-12s : %s\n' "base url" "${OPSBRIDGE_BASE_URL:-(vendor default)}"
     printf '  %-12s : %s\n' "API key"  "$(_mask "$OPSBRIDGE_API_KEY")"
     printf '  %-12s : %s\n' "pubkey"   "${OPSBRIDGE_PUBKEY:-(skipped — add manually later)}"
+    printf '  %-12s : %s\n' "model"    "${OPSBRIDGE_MODEL:-(selected during: opsbridge install)}"
     echo
 }
 
