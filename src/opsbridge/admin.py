@@ -60,21 +60,100 @@ DEPLOY_SHARE_CANDIDATES = [
 # ---------------------------------------------------------------------------
 
 KNOWN_MODELS: dict[str, dict[str, int]] = {
-    "claude-opus-4-7":           {"contextWindow": 200_000, "maxTokens":  32_000},
-    "claude-opus-4-5":           {"contextWindow": 200_000, "maxTokens":  32_000},
-    "claude-sonnet-4-6":         {"contextWindow": 200_000, "maxTokens":  64_000},
-    "claude-sonnet-4-5":         {"contextWindow": 200_000, "maxTokens":  64_000},
-    "claude-haiku-4-5-20251001": {"contextWindow": 200_000, "maxTokens":   8_192},
-    "claude-haiku-4-5":          {"contextWindow": 200_000, "maxTokens":   8_192},
-    "gpt-4o":                    {"contextWindow": 128_000, "maxTokens":  16_384},
-    "gpt-4o-mini":               {"contextWindow": 128_000, "maxTokens":  16_384},
-    "gpt-4.1":                   {"contextWindow": 1_047_576, "maxTokens": 32_768},
-    "gpt-4.1-mini":              {"contextWindow": 1_047_576, "maxTokens": 32_768},
-    "gpt-4.1-nano":              {"contextWindow": 1_047_576, "maxTokens": 32_768},
-    "o1":                        {"contextWindow": 200_000, "maxTokens": 100_000},
-    "o3":                        {"contextWindow": 200_000, "maxTokens": 100_000},
-    "o4-mini":                   {"contextWindow": 200_000, "maxTokens": 100_000},
+    # Anthropic Claude 4.x
+    "claude-opus-4-7":              {"contextWindow": 200_000, "maxTokens":  32_000},
+    "claude-opus-4-5":              {"contextWindow": 200_000, "maxTokens":  32_000},
+    "claude-sonnet-4-6":            {"contextWindow": 200_000, "maxTokens":  64_000},
+    "claude-sonnet-4-5":            {"contextWindow": 200_000, "maxTokens":  64_000},
+    "claude-haiku-4-5-20251001":    {"contextWindow": 200_000, "maxTokens":   8_192},
+    "claude-haiku-4-5":             {"contextWindow": 200_000, "maxTokens":   8_192},
+    # Anthropic Claude 3.5
+    "claude-3-5-sonnet-20241022":   {"contextWindow": 200_000, "maxTokens":   8_192},
+    "claude-3-5-haiku-20241022":    {"contextWindow": 200_000, "maxTokens":   8_192},
+    # Anthropic Claude 3
+    "claude-3-opus-20240229":       {"contextWindow": 200_000, "maxTokens":   4_096},
+    "claude-3-sonnet-20240229":     {"contextWindow": 200_000, "maxTokens":   4_096},
+    "claude-3-haiku-20240307":      {"contextWindow": 200_000, "maxTokens":   4_096},
+    # OpenAI GPT-4o
+    "gpt-4o":                       {"contextWindow":   128_000, "maxTokens":  16_384},
+    "gpt-4o-mini":                  {"contextWindow":   128_000, "maxTokens":  16_384},
+    # OpenAI GPT-4.1 (1 M context)
+    "gpt-4.1":                      {"contextWindow": 1_047_576, "maxTokens":  32_768},
+    "gpt-4.1-mini":                 {"contextWindow": 1_047_576, "maxTokens":  32_768},
+    "gpt-4.1-nano":                 {"contextWindow": 1_047_576, "maxTokens":  32_768},
+    # OpenAI GPT-5.x (1 M+ context, 128 K max output per May-2026 specs)
+    "gpt-5":                        {"contextWindow": 1_047_576, "maxTokens": 128_000},
+    "gpt-5.3-codex":                {"contextWindow": 1_047_576, "maxTokens": 128_000},
+    "gpt-5.3-codex-spark":          {"contextWindow": 1_047_576, "maxTokens": 128_000},
+    "gpt-5.4":                      {"contextWindow": 1_047_576, "maxTokens": 128_000},
+    "gpt-5.4-mini":                 {"contextWindow": 1_047_576, "maxTokens":  32_768},
+    "gpt-5.5":                      {"contextWindow": 1_047_576, "maxTokens": 128_000},
+    # OpenAI reasoning models
+    "o1":                           {"contextWindow":   200_000, "maxTokens": 100_000},
+    "o1-mini":                      {"contextWindow":   128_000, "maxTokens":  65_536},
+    "o3":                           {"contextWindow":   200_000, "maxTokens": 100_000},
+    "o3-mini":                      {"contextWindow":   200_000, "maxTokens": 100_000},
+    "o4-mini":                      {"contextWindow":   200_000, "maxTokens": 100_000},
+    # Google Gemini 2.5
+    "gemini-2.5-pro":               {"contextWindow": 1_048_576, "maxTokens":  65_535},
+    "gemini-2.5-flash":             {"contextWindow": 1_048_576, "maxTokens":  65_535},
+    "gemini-2.5-flash-lite":        {"contextWindow": 1_048_576, "maxTokens":  65_535},
+    # Google Gemini 2.0 / 1.5
+    "gemini-2.0-flash":             {"contextWindow": 1_048_576, "maxTokens":   8_192},
+    "gemini-1.5-pro":               {"contextWindow": 2_097_152, "maxTokens":   8_192},
+    "gemini-1.5-flash":             {"contextWindow": 1_048_576, "maxTokens":   8_192},
+    # Shorthand aliases used by some proxies
+    "gemini-flash":                 {"contextWindow": 1_048_576, "maxTokens":  65_535},
+    "gemini-flash-lite":            {"contextWindow": 1_048_576, "maxTokens":  65_535},
+    # xAI Grok 4.x (1 M context, ~30 K max output per May-2026 specs)
+    "grok-4.3":                     {"contextWindow": 1_000_000, "maxTokens":  30_720},
+    "grok-4.20-0309":               {"contextWindow": 1_000_000, "maxTokens":  30_720},
+    "grok-4.20-0309-non-reasoning": {"contextWindow": 1_000_000, "maxTokens":  30_720},
+    "grok-4.20-0309-reasoning":     {"contextWindow": 1_000_000, "maxTokens":  30_720},
+    "grok-4.20-auto":               {"contextWindow": 1_000_000, "maxTokens":  30_720},
+    "grok-4.20-expert":             {"contextWindow": 1_000_000, "maxTokens":  30_720},
+    "grok-4.20-fast":               {"contextWindow": 1_000_000, "maxTokens":  30_720},
+    # xAI Grok 3.x (deprecated May-2026; 1 M context, ~4 K max output)
+    "grok-3":                       {"contextWindow": 1_000_000, "maxTokens":   4_096},
+    "grok-3-fast":                  {"contextWindow": 1_000_000, "maxTokens":   4_096},
+    "grok-3-mini":                  {"contextWindow": 1_000_000, "maxTokens":   4_096},
 }
+
+# Pattern-based fallback: (substring, contextWindow, maxTokens)
+# Checked in order; first match wins.  Used when exact ID not in KNOWN_MODELS.
+_MODEL_PATTERNS: list[tuple[str, int, int]] = [
+    ("claude-opus",      200_000,   32_000),
+    ("claude-sonnet",    200_000,   64_000),
+    ("claude-haiku",     200_000,    8_192),
+    ("claude-3",         200_000,    8_192),
+    ("claude",           200_000,   32_000),
+    ("gpt-5",          1_047_576,  128_000),
+    ("gpt-4.1",        1_047_576,   32_768),
+    ("gpt-4o",           128_000,   16_384),
+    ("gpt-4",            128_000,    8_192),
+    ("o1",               200_000,  100_000),
+    ("o3",               200_000,  100_000),
+    ("o4",               200_000,  100_000),
+    ("gemini-2.5",     1_048_576,   65_535),
+    ("gemini-2",       1_048_576,    8_192),
+    ("gemini-1.5",     2_097_152,    8_192),
+    ("gemini-flash",   1_048_576,   65_535),
+    ("gemini",           128_000,    8_192),
+    ("grok-4",         1_000_000,   30_720),
+    ("grok-3",         1_000_000,    4_096),
+    ("grok",           1_000_000,   30_720),
+    ("haiku",            200_000,    8_192),
+]
+
+
+def _infer_model_meta(model_id: str) -> dict[str, int]:
+    """Return approximate {contextWindow, maxTokens} by matching the model ID against
+    known name patterns.  Falls back to conservative defaults if nothing matches."""
+    lower = model_id.lower()
+    for pattern, ctx, max_tok in _MODEL_PATTERNS:
+        if pattern in lower:
+            return {"contextWindow": ctx, "maxTokens": max_tok}
+    return {"contextWindow": 128_000, "maxTokens": 4_096}
 
 ANTHROPIC_MODELS_ORDERED = [
     "claude-opus-4-7",
@@ -534,11 +613,11 @@ def _parse_model_selection(raw: str, max_idx: int) -> list[int]:
 
 
 def _lookup_or_prompt_model_meta(model_id: str) -> dict:
-    """Return {id, contextWindow, maxTokens} — look up KNOWN_MODELS or use defaults."""
+    """Return {id, contextWindow, maxTokens} — exact registry, then pattern inference."""
     meta = KNOWN_MODELS.get(model_id)
     if meta:
         return {"id": model_id, **meta}
-    return {"id": model_id, "contextWindow": 128_000, "maxTokens": 4_096}
+    return {"id": model_id, **_infer_model_meta(model_id)}
 
 
 def _prompt_default_model(selected_ids: list[str], existing_default: str) -> str:
@@ -657,10 +736,9 @@ def _prompt_model_config(existing: dict | None = None) -> dict:
     unknown_metas = [m for m in models_meta if m["id"] not in KNOWN_MODELS]
     if unknown_metas:
         print()
-        print(f"  {len(unknown_metas)} model(s) not in local registry — "
-              f"defaulted to ctx=128 000, max=4 096:")
+        print(f"  {len(unknown_metas)} model(s) not in local registry — inferred limits:")
         for m in unknown_metas:
-            print(f"    {m['id']}")
+            print(f"    {m['id']:<40}  ctx={m['contextWindow']:>9,}  max={m['maxTokens']:>7,}")
         print()
         ans = _prompt("  Configure token limits for these now?", default="n")
         if ans.lower().startswith("y"):

@@ -1,3 +1,3 @@
 """OpsBridge — SSH-login agent daemon (umbrella package)."""
 
-__version__ = "0.5.5"
+__version__ = "0.5.7"
