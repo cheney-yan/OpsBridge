@@ -51,13 +51,13 @@ curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/main/install.s
   | bash -s -- uninstall
 ```
 
-Unattended / CI:
+Unattended / CI (use `export` — prefix-only syntax doesn't propagate through the pipe):
 
 ```bash
-OPSBRIDGE_PROVIDER=anthropic \
-OPSBRIDGE_MODEL=claude-opus-4-7 \
-OPSBRIDGE_API_KEY=... \
-OPSBRIDGE_PUBKEY="ssh-ed25519 AAAA... me@laptop" \
+export OPSBRIDGE_PROVIDER=anthropic
+export OPSBRIDGE_MODEL=claude-opus-4-7
+export OPSBRIDGE_API_KEY=...
+export OPSBRIDGE_PUBKEY="ssh-ed25519 AAAA... me@laptop"
 curl -fsSL https://raw.githubusercontent.com/cheney-yan/OpsBridge/main/install.sh | bash
 ```
 
