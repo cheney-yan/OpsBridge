@@ -236,16 +236,25 @@ def _ensure_venv(use_system_python: bool, src_dir: Path) -> None:
 
 
 def _install_pi() -> None:
-    """Install pi.dev coding agent via npm."""
+    """Install pi.dev coding agent via npm. Skips if already in PATH."""
+    if shutil.which("pi"):
+        return
     npm = shutil.which("npm")
     if npm is None:
         raise RuntimeError(
             "npm not found — install Node.js first (https://nodejs.org/)"
         )
-    subprocess.run(
+    result = subprocess.run(
         [npm, "install", "-g", "--ignore-scripts", "@mariozechner/pi-coding-agent"],
-        check=True,
+        check=False,
     )
+    if result.returncode != 0:
+        # Retry with --force in case a stale file is blocking the symlink
+        subprocess.run(
+            [npm, "install", "-g", "--ignore-scripts", "--force",
+             "@mariozechner/pi-coding-agent"],
+            check=True,
+        )
 
 
 def _ensure_sudoers() -> None:
