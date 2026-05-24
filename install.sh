@@ -244,32 +244,6 @@ log "bootstrap (uv + venv) ..."
 # Helper functions for interactive prompts
 # ---------------------------------------------------------------------------
 
-# Read a secret with visible `*` echo per character.
-read_secret_starred() {
-    local prompt="$1"
-    local secret="" char
-    printf '%s' "$prompt"
-    while IFS= read -r -s -n1 char; do
-        if [[ -z "$char" ]]; then
-            break
-        fi
-        case "$char" in
-            $'\x7f'|$'\b')
-                if [[ -n "$secret" ]]; then
-                    secret="${secret%?}"
-                    printf '\b \b'
-                fi
-                ;;
-            *)
-                secret+="$char"
-                printf '*'
-                ;;
-        esac
-    done
-    printf '\n'
-    REPLY="$secret"
-}
-
 # Mask a secret for confirmation echo.
 _mask() {
     local s="$1" n=${#1}
@@ -278,39 +252,6 @@ _mask() {
     else
         printf '(%d chars)' "$n"
     fi
-}
-
-prompt_for_config() {
-    echo
-    log "Configure model"
-
-    local provider
-
-    while :; do
-        read -r -p "Provider [anthropic/openai] [anthropic]: " provider
-        provider=${provider:-anthropic}
-        case "$provider" in
-            anthropic|openai) break ;;
-            *) echo "  must be 'openai' or 'anthropic'" >&2 ;;
-        esac
-    done
-    export OPSBRIDGE_PROVIDER="$provider"
-
-    local base_url
-    read -r -p "Custom base URL (empty = official endpoint): " base_url
-    export OPSBRIDGE_BASE_URL="${base_url:-}"
-
-    while :; do
-        read_secret_starred "Paste API key: "
-        if [[ -z "$REPLY" ]]; then
-            echo "  API key cannot be empty" >&2
-            continue
-        fi
-        export OPSBRIDGE_API_KEY="$REPLY"
-        echo "  captured: $(_mask "$OPSBRIDGE_API_KEY")  → /etc/opsbridge/agent/api.key"
-        break
-    done
-    # Model discovery and selection is handled by: opsbridge install
 }
 
 show_config_review() {
@@ -327,11 +268,17 @@ show_config_review() {
 check_llm_endpoint() {
     [[ "${OPSBRIDGE_SKIP_LLM_CHECK:-0}" == "1" ]] && return 0
 
-    local provider="$OPSBRIDGE_PROVIDER"
-    local model="$OPSBRIDGE_MODEL"
+    local provider="${OPSBRIDGE_PROVIDER:-openai}"
     local key="$OPSBRIDGE_API_KEY"
     local base="${OPSBRIDGE_BASE_URL:-}"
     local body http url
+
+    # Use provider defaults when model not specified
+    local model="${OPSBRIDGE_MODEL:-}"
+    if [[ -z "$model" ]]; then
+        [[ "$provider" == "anthropic" ]] && model="claude-sonnet-4-6" || model="gpt-4.1-mini"
+    fi
+
     body=$(mktemp)
 
     if [[ "$provider" == "openai" || -n "$base" ]]; then
@@ -367,50 +314,42 @@ check_llm_endpoint() {
     return 1
 }
 
-prompt_for_pubkey() {
-    [[ -n "${OPSBRIDGE_PUBKEY:-}" ]] && return 0
-    echo
-    log "Authorize an SSH pubkey"
-    echo "Paste the full pubkey line, then press Enter. Empty to skip."
-    local pubkey
-    read -r -p "> " pubkey
-    [[ -n "$pubkey" ]] && export OPSBRIDGE_PUBKEY="$pubkey"
-}
+# --- 5. determine opsbridge install flags ------------------------------------
+# install.sh no longer collects provider/key/model interactively — that is
+# fully handled by `opsbridge install --interactive`.  install.sh only needs
+# to decide which flags to pass.
+INSTALL_ARGS=()
 
-# --- 5. interactive prompts ---------------------------------------------------
-NEEDS_PROMPT=1
-if [[ "$EXISTING_INSTALL" -eq 1 && "$CHOICE" =~ ^[kK]$ ]]; then
-    NEEDS_PROMPT=0
-fi
-if [[ -n "${OPSBRIDGE_API_KEY:-}" ]]; then
-    NEEDS_PROMPT=0
-    log "OPSBRIDGE_API_KEY present — non-interactive env-var install"
-fi
-if [[ "$SUPPORTS_TTY" -eq 0 && -z "${OPSBRIDGE_API_KEY:-}" ]]; then
-    die "no TTY and no OPSBRIDGE_API_KEY — set env vars (see install.sh header) or run with a TTY"
-fi
-if [[ "$NEEDS_PROMPT" -eq 1 ]]; then
-    prompt_for_config
-    show_config_review
-    prompt_for_pubkey
-elif [[ -n "${OPSBRIDGE_API_KEY:-}" ]]; then
-    show_config_review
-    if ! check_llm_endpoint; then
-        warn "Continuing despite failed probe (env-var mode). Fix later with:"
-        warn "    sudo opsbridge config"
+if [[ "$EXISTING_INSTALL" -eq 1 ]]; then
+    case "$CHOICE" in
+        k|K) INSTALL_ARGS+=("--skip-model-config") ;;
+        r|R)
+            INSTALL_ARGS+=("--reconfigure")
+            # interactive reconfigure: let admin.py show the provider/model menu
+            if [[ "$SUPPORTS_TTY" -eq 1 && -z "${OPSBRIDGE_API_KEY:-}" ]]; then
+                INSTALL_ARGS+=("--interactive")
+            fi
+            ;;
+    esac
+else
+    # Fresh install
+    if [[ -n "${OPSBRIDGE_API_KEY:-}" ]]; then
+        log "OPSBRIDGE_API_KEY present — non-interactive env-var install"
+        show_config_review
+        if ! check_llm_endpoint; then
+            warn "Continuing despite failed probe. Fix with: sudo opsbridge config"
+        fi
+    elif [[ "$SUPPORTS_TTY" -eq 1 ]]; then
+        # Full interactive: admin.py shows provider menu, discovers models, prompts for pubkey
+        INSTALL_ARGS+=("--interactive")
+    else
+        die "no TTY and no OPSBRIDGE_API_KEY — set env vars (see install.sh header) or run with a TTY"
     fi
 fi
 
-# --- 6. opsbridge install -----------------------------------------------------
-ARGS=()
-if [[ "$EXISTING_INSTALL" -eq 1 && "$CHOICE" =~ ^[kK]$ ]]; then
-    ARGS+=("--skip-model-config")
-elif [[ "$EXISTING_INSTALL" -eq 1 && "$CHOICE" =~ ^[rR]$ ]]; then
-    ARGS+=("--reconfigure")
-fi
-
-log "running: opsbridge install ${ARGS[*]:-(no args)}"
-/usr/local/bin/opsbridge install "${ARGS[@]}"
+# --- 6. opsbridge install ---------------------------------------------------
+log "running: opsbridge install ${INSTALL_ARGS[*]:-(no args)}"
+/usr/local/bin/opsbridge install "${INSTALL_ARGS[@]}"
 
 log "done."
 log "  config + api.key  → /etc/opsbridge/agent/"
