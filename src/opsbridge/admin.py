@@ -709,8 +709,7 @@ def _prompt_model_config(existing: dict | None = None) -> dict:
 
     print(f"  Available models ({provider}{' — custom endpoint' if base_url else ''}):")
     for i, mid in enumerate(discovered, 1):
-        marker = " ←" if mid == existing.get("model", "") else ""
-        print(f"    {i:2d}. {mid}{marker}")
+        print(f"    {i:2d}. {mid}")
     print()
     print("  Select models to register (numbers, ranges like 1-3, comma list, or 'all').")
 
